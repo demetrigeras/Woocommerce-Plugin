@@ -10,7 +10,13 @@ if (!defined('ABSPATH')) {
 }
 
 class SP_Webhook_Handler {
-    
+
+    /** Seconds a delivery's timestamp may differ from ours before we reject it. */
+    const SIGNATURE_TOLERANCE = 300;
+
+    /** How long a handled event id is remembered, to absorb delivery retries. */
+    const EVENT_DEDUPE_TTL = DAY_IN_SECONDS;
+
     /**
      * Constructor
      */
@@ -59,48 +65,41 @@ class SP_Webhook_Handler {
      */
     public function handle_webhook($request) {
         error_log('🔔 PP Webhook - Received webhook request at ' . current_time('mysql'));
-        error_log('🔔 PP Webhook - Request headers: ' . json_encode($request->get_headers()));
-        error_log('🔔 PP Webhook - Raw body: ' . $request->get_body());
         error_log('🔔 PP Webhook - User Agent: ' . ($_SERVER['HTTP_USER_AGENT'] ?? 'Not set'));
         error_log('🔔 PP Webhook - Remote IP: ' . ($_SERVER['REMOTE_ADDR'] ?? 'Not set'));
-        
-        // Verify per-site webhook secret
-        $expected = get_option('sp_webhook_secret');
-        $provided = $request->get_param('secret');
-        if (!$provided) {
-            // Try header fallback
-            $headers = $request->get_headers();
-            $provided = $headers['x-coinsub-secret'][0] ?? null;
+
+        // The signature covers the bytes exactly as sent. Read the raw body here and
+        // verify against it BEFORE any JSON decode - decoding and re-encoding changes
+        // the bytes (key order, unicode escaping, whitespace) and breaks the HMAC.
+        $raw_body = $request->get_body();
+
+        $verification = $this->verify_delivery($request, $raw_body);
+        if (is_wp_error($verification)) {
+            error_log('❌ PP Webhook - Rejected: ' . $verification->get_error_message());
+            return new WP_REST_Response(
+                array('error' => $verification->get_error_message()),
+                (int) ($verification->get_error_data() ?: 401)
+            );
         }
-        
-        error_log('🔔 PP Webhook - Secret check: Expected=' . ($expected ? 'SET (' . strlen($expected) . ' chars)' : 'EMPTY') . ', Provided=' . ($provided ? 'SET (' . strlen($provided) . ' chars)' : 'EMPTY'));
-        
-        if (!empty($expected)) {
-            if (empty($provided)) {
-                error_log('❌ PP Webhook - Secret required but not provided');
-                return new WP_REST_Response(array('error' => 'Unauthorized - Secret required'), 401);
-            }
-            if (hash_equals($expected, (string)$provided) === false) {
-                error_log('❌ PP Webhook - Secret mismatch');
-                error_log('❌ PP Webhook - Expected: ' . substr($expected, 0, 10) . '...');
-                error_log('❌ PP Webhook - Provided: ' . substr($provided, 0, 10) . '...');
-                return new WP_REST_Response(array('error' => 'Unauthorized - Secret mismatch'), 401);
-            }
-            error_log('✅ PP Webhook - Secret verified');
-        } else {
-            error_log('⚠️ PP Webhook - No secret configured, allowing webhook (not recommended for production)');
+
+        // Deliveries retry on failure, so the same event legitimately arrives more
+        // than once. Claim the event id before doing any work.
+        $event_id = $request->get_header('x-event-id');
+        if ($event_id !== null && $event_id !== '' && !$this->claim_event($event_id)) {
+            error_log('🔁 PP Webhook - Duplicate delivery for event ' . $event_id . ' - acknowledging without reprocessing');
+            return new WP_REST_Response(array('status' => 'duplicate'), 200);
         }
-        
+
         // Get the request body
         $data = $request->get_json_params();
-        
+
         if (!$data) {
             error_log('❌ PP Webhook - Invalid JSON data');
             return new WP_REST_Response(array('error' => 'Invalid JSON data'), 400);
         }
-        
+
         error_log('🔔 PP Webhook - Data: ' . json_encode($data));
-        
+
         // Log specific data structures for debugging
         if (isset($data['agreement'])) {
             error_log('🔔 PP Webhook - Agreement data: ' . json_encode($data['agreement']));
@@ -108,21 +107,7 @@ class SP_Webhook_Handler {
         if (isset($data['transaction_details'])) {
             error_log('🔔 PP Webhook - Transaction details: ' . json_encode($data['transaction_details']));
         }
-        
-        // Verify webhook signature if signature header is present (optional)
-        $raw_data = $request->get_body();
-        $signature_header = $_SERVER['HTTP_X_COINSUB_SIGNATURE'] ?? '';
-        if (!empty($signature_header)) {
-            // Only verify signature if header is present
-            if (!$this->verify_webhook_signature($raw_data)) {
-                error_log('❌ PP Webhook - Invalid signature - rejecting webhook');
-                return new WP_REST_Response(array('error' => 'Invalid signature'), 401);
-            }
-            error_log('✅ PP Webhook - Signature verified');
-        } else {
-            error_log('ℹ️ PP Webhook - No signature header present, skipping signature verification (using secret only)');
-        }
-        
+
         // Process the webhook
         $this->process_webhook($data);
         
@@ -838,31 +823,120 @@ class SP_Webhook_Handler {
     }
     
     /**
-     * Verify webhook signature
+     * Authenticate an inbound delivery.
+     *
+     * Two schemes are accepted, in priority order:
+     *
+     *  1. HMAC signature (auto-provisioned webhooks). The signing secret is issued
+     *     by the API at registration and stored locally.
+     *  2. Legacy shared secret, passed as a `secret` query arg or an
+     *     `x-coinsub-secret` header. This is how manually-created webhooks
+     *     authenticate; kept so merchants who set theirs up by hand keep working
+     *     until their record is re-provisioned.
+     *
+     * @return true|WP_Error
      */
-    private function verify_webhook_signature($raw_data) {
-        $webhook_secret = get_option('sp_webhook_secret', '');
-        
-        if (empty($webhook_secret)) {
-            // If no secret is configured, allow all webhooks (not recommended for production)
-            error_log('PP Webhook: No webhook secret configured - allowing all webhooks');
+    private function verify_delivery($request, $raw_body) {
+        $signature      = $request->get_header('x-webhook-signature');
+        $signing_secret = class_exists('SP_Webhook_Provisioner')
+            ? SP_Webhook_Provisioner::signing_secret()
+            : '';
+
+        if (!empty($signature)) {
+            if ($signing_secret === '') {
+                return new WP_Error(
+                    'sp_no_signing_secret',
+                    'Signed delivery received but this site has no signing secret stored. Re-save the payment settings to register the webhook.',
+                    401
+                );
+            }
+            return $this->verify_signature($request, $raw_body, $signature, $signing_secret);
+        }
+
+        $legacy_secret = get_option('sp_webhook_secret', '');
+        if (!empty($legacy_secret)) {
+            $provided = $request->get_param('secret');
+            if (!$provided) {
+                $headers  = $request->get_headers();
+                $provided = $headers['x-coinsub-secret'][0] ?? null;
+            }
+            if (empty($provided)) {
+                return new WP_Error('sp_secret_required', 'Unauthorized - secret required', 401);
+            }
+            if (!hash_equals($legacy_secret, (string) $provided)) {
+                return new WP_Error('sp_secret_mismatch', 'Unauthorized - secret mismatch', 401);
+            }
+            error_log('✅ PP Webhook - Verified via legacy shared secret');
             return true;
         }
-        
-        $signature = $_SERVER['HTTP_X_COINSUB_SIGNATURE'] ?? '';
-        
-        if (empty($signature)) {
-            error_log('PP Webhook: No signature header provided');
+
+        // Provisioned sites must present a signature; an unsigned delivery here is
+        // either a misconfiguration or someone probing the endpoint.
+        if ($signing_secret !== '') {
+            return new WP_Error('sp_signature_required', 'Unauthorized - signature required', 401);
+        }
+
+        error_log('⚠️ PP Webhook - No secret configured, allowing webhook (not recommended for production)');
+        return true;
+    }
+
+    /**
+     * HMAC-SHA256 over "{timestamp}.{raw_body}", base64, constant-time compared.
+     *
+     * @return true|WP_Error
+     */
+    private function verify_signature($request, $raw_body, $signature, $secret) {
+        $version = $request->get_header('x-webhook-signature-version');
+        if (!empty($version) && strtolower(trim($version)) !== 'v1') {
+            return new WP_Error(
+                'sp_unsupported_signature_version',
+                'Unsupported signature version: ' . sanitize_text_field($version),
+                400
+            );
+        }
+
+        $timestamp = $request->get_header('x-webhook-timestamp');
+        if ($timestamp === null || $timestamp === '' || !ctype_digit((string) $timestamp)) {
+            return new WP_Error('sp_missing_timestamp', 'Unauthorized - missing or malformed timestamp', 401);
+        }
+
+        // Bound replay. A delivery far outside this window is either a replay or a
+        // badly skewed clock; either way it is not safe to act on.
+        $skew = abs(time() - (int) $timestamp);
+        if ($skew > self::SIGNATURE_TOLERANCE) {
+            return new WP_Error(
+                'sp_stale_timestamp',
+                'Unauthorized - timestamp outside the allowed window (' . $skew . 's). Check this server\'s clock.',
+                401
+            );
+        }
+
+        $expected = base64_encode(
+            hash_hmac('sha256', $timestamp . '.' . $raw_body, $secret, true)
+        );
+
+        if (!hash_equals($expected, (string) $signature)) {
+            return new WP_Error('sp_invalid_signature', 'Unauthorized - invalid signature', 401);
+        }
+
+        error_log('✅ PP Webhook - Signature verified');
+        return true;
+    }
+
+    /**
+     * Claim an event id, returning false if it has already been handled.
+     *
+     * Retries mean the same event can arrive several times; only the first claim
+     * should do work.
+     */
+    private function claim_event($event_id) {
+        $key = 'sp_evt_' . md5((string) $event_id);
+
+        if (get_transient($key)) {
             return false;
         }
-        
-        $expected_signature = hash_hmac('sha256', $raw_data, $webhook_secret);
-        
-        if (!hash_equals($expected_signature, $signature)) {
-            error_log('PP Webhook: Signature verification failed');
-            return false;
-        }
-        
+
+        set_transient($key, 1, self::EVENT_DEDUPE_TTL);
         return true;
     }
     

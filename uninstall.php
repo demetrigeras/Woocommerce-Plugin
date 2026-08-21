@@ -36,6 +36,12 @@ function sp_uninstall_plugin() {
     delete_option('sp_checkout_page_id');
     delete_option('sp_legacy_migration_version');
 
+    // Webhook auto-provisioning state (the signing secret is a credential).
+    delete_option('sp_webhook_id');
+    delete_option('sp_webhook_signing_secret');
+    delete_option('sp_webhook_registered_url');
+    delete_option('sp_webhook_provision_status');
+
     // Options left behind by builds that used the legacy key prefix. The
     // migration copies rather than moves them, so they can still be present.
     delete_option('woocommerce_coinsub_settings');

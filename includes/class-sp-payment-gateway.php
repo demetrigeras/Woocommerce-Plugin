@@ -363,11 +363,13 @@ class WC_Gateway_SP extends WC_Payment_Gateway {
                 'title' => __('Webhook URL', 'stablecoin-pay'),
                 'type' => 'text',
                 'description' => $this->get_webhook_destination_description(),
-                'default' => (function() {
-                    $secret = get_option('sp_webhook_secret');
-                    $base = home_url('/wp-json/stablecoin/v1/webhook');
-                    return $secret ? add_query_arg('secret', $secret, $base) : $base;
-                })(),
+                // Shown for reference only. Deliberately carries no secret: the old
+                // value embedded one as a query arg, which leaks it into access
+                // logs, browser history and referrer headers. Auto-provisioned
+                // webhooks authenticate with an HMAC signature instead.
+                'default' => class_exists('SP_Webhook_Provisioner')
+                    ? SP_Webhook_Provisioner::callback_url()
+                    : get_rest_url(null, 'stablecoin/v1/webhook'),
                 'custom_attributes' => array('readonly' => 'readonly'),
                 'css' => 'background: #f0f0f0;',
             ),
@@ -775,9 +777,18 @@ class WC_Gateway_SP extends WC_Payment_Gateway {
         } else {
             error_log('PP Whitelabel: ⚠️ Skipping branding fetch - no credentials AND no payment provider name');
         }
-        
+
+        // Register this site's webhook with the API so the merchant never has to
+        // create one by hand. Idempotent: saving twice reuses the existing record
+        // rather than creating a second. Failures are recorded for an admin notice
+        // and deliberately do not affect $result - a webhook problem must never
+        // stop settings saving or block checkout.
+        if (class_exists('SP_Webhook_Provisioner')) {
+            SP_Webhook_Provisioner::sync();
+        }
+
         error_log('═══════════════════════════════════════════════════════════');
-        
+
         return $result;
     }
     
@@ -1788,15 +1799,50 @@ class WC_Gateway_SP extends WC_Payment_Gateway {
      *
      * @return string
      */
-    public function get_webhook_destination_description() {
-        $dashboard_url = $this->get_dashboard_url_from_config();
-        $plugin_name = class_exists('SP_Whitelabel_Branding') ? SP_Whitelabel_Branding::get_whitelabel_plugin_name_from_config() : null;
-        if ($dashboard_url && $plugin_name) {
-            $host = parse_url($dashboard_url, PHP_URL_HOST);
-            $link = '<a href="' . esc_url($dashboard_url) . '" target="_blank" rel="noopener">' . esc_html($host ?: $dashboard_url) . '</a>';
-            return sprintf(__('Copy this URL, then add it as an endpoint in your %1$s dashboard at %2$s under <strong>Settings &rarr; Webhooks</strong>. This URL receives payment confirmations and automatically updates order status to "Processing" when payment is complete.', 'stablecoin-pay'), esc_html($plugin_name), $link);
+    /**
+     * The webhook URL is derived from the site, never stored.
+     *
+     * Older builds saved it with the shared secret appended as `?secret=...`, so a
+     * merchant who saved settings before upgrading still has that credential
+     * sitting in the options table. Resolving the field here means the stale value
+     * can never be rendered back into the settings form, whatever wrote it.
+     *
+     * @param string $key
+     * @param mixed  $empty_value
+     * @return mixed
+     */
+    public function get_option($key, $empty_value = null) {
+        if ($key === 'webhook_url') {
+            return class_exists('SP_Webhook_Provisioner')
+                ? SP_Webhook_Provisioner::callback_url()
+                : get_rest_url(null, 'stablecoin/v1/webhook');
         }
-        return __('Copy this URL, then add it as an endpoint in your merchant dashboard under <strong>Settings &rarr; Webhooks</strong>. This URL receives payment confirmations and automatically updates order status to "Processing" when payment is complete.', 'stablecoin-pay');
+
+        return parent::get_option($key, $empty_value);
+    }
+
+    public function get_webhook_destination_description() {
+        // The plugin registers this URL itself when settings are saved, so there is
+        // nothing for the merchant to copy. Report what actually happened instead.
+        $status = class_exists('SP_Webhook_Provisioner') ? SP_Webhook_Provisioner::status() : array();
+        $state  = isset($status['state']) ? $status['state'] : '';
+
+        $intro = __('Registered automatically when you save these settings &mdash; no dashboard setup needed. This URL receives payment confirmations and moves orders to "Processing" when payment completes.', 'stablecoin-pay');
+
+        if ($state === 'ok') {
+            $webhook_id = SP_Webhook_Provisioner::webhook_id();
+            return $intro . '<br><strong style="color:#1a7f37;">&#10003; '
+                 . esc_html__('Registered', 'stablecoin-pay') . '</strong>'
+                 . ($webhook_id ? ' <code>#' . esc_html($webhook_id) . '</code>' : '');
+        }
+
+        if ($state !== '' && !empty($status['message'])) {
+            $colour = ($state === 'unreachable' || $state === 'incomplete') ? '#b26200' : '#b32d2e';
+            return $intro . '<br><strong style="color:' . esc_attr($colour) . ';">'
+                 . esc_html($status['message']) . '</strong>';
+        }
+
+        return $intro;
     }
 
     /**
@@ -1829,14 +1875,8 @@ class WC_Gateway_SP extends WC_Payment_Gateway {
                 __('Navigate to <strong>Settings &rarr; API Keys</strong> in your dashboard at %s', 'stablecoin-pay'),
                 $dashboard_link
             );
-            $go_back_phrase = sprintf(
-                /* translators: %s: linked dashboard hostname (e.g. app.paymentservers.com) */
-                __('Go back to your dashboard and open <strong>Settings &rarr; Webhooks</strong> at %s', 'stablecoin-pay'),
-                $dashboard_link
-            );
         } else {
             $nav_dashboard_phrase = __('Navigate to <strong>Settings &rarr; API Keys</strong> in your dashboard', 'stablecoin-pay');
-            $go_back_phrase = __('Go back to your dashboard and open <strong>Settings &rarr; Webhooks</strong>', 'stablecoin-pay');
         }
 
         $step3_title = $plugin_name ? sprintf(__('Step 3: Enable %s', 'stablecoin-pay'), esc_html($plugin_name)) : __('Step 3: Enable payment provider', 'stablecoin-pay');
@@ -1880,13 +1920,11 @@ class WC_Gateway_SP extends WC_Payment_Gateway {
             <li><?php echo __('After you open <strong>Settings &rarr; API Keys</strong>, click <strong>Add API</strong>, name your API key, select <strong>Full Access</strong> for permissions, click <strong>Review Key</strong>, and then copy and paste the generated API key into the <strong>API Key</strong> field in WooCommerce settings.', 'stablecoin-pay'); ?></li>
             <li><?php esc_html_e('Paste both into the fields below', 'stablecoin-pay'); ?></li>
         </ol>
-        <h4 style="margin:1.5em 0 .5em"><?php esc_html_e('Step 2: Configure Webhook (CRITICAL)', 'stablecoin-pay'); ?></h4>
+        <h4 style="margin:1.5em 0 .5em"><?php esc_html_e('Step 2: Webhook (automatic)', 'stablecoin-pay'); ?></h4>
         <ol style="line-height:1.6;margin-top:0">
-            <li><?php echo __('Copy the <strong>Webhook URL</strong> shown below (it will look like: <code>https://yoursite.com/wp-json/stablecoin/v1/webhook</code>)', 'stablecoin-pay'); ?></li>
-            <li><?php echo $go_back_phrase; ?></li>
-            <li><?php echo __('Click <strong>Add Endpoint</strong>', 'stablecoin-pay'); ?></li>
-            <li><?php echo __('<strong>Paste your webhook URL</strong> and save &mdash; there is nothing else to configure', 'stablecoin-pay'); ?></li>
-            <li><em><?php esc_html_e('This is essential', 'stablecoin-pay'); ?></em> — <?php esc_html_e('without this, orders won\'t update when payments complete!', 'stablecoin-pay'); ?></li>
+            <li><?php echo __('Nothing to do &mdash; when you click <strong>Save changes</strong>, this plugin registers its own webhook with your account.', 'stablecoin-pay'); ?></li>
+            <li><?php echo __('The <strong>Webhook URL</strong> below is shown for reference only. You do not need to copy it anywhere.', 'stablecoin-pay'); ?></li>
+            <li><?php echo __('If registration fails you will see a notice here with a <strong>Retry webhook setup</strong> button. Payments keep working either way, but orders will not update until the webhook is registered.', 'stablecoin-pay'); ?></li>
         </ol>
         <h4 style="margin:1.5em 0 .5em"><?php echo $step3_title; ?></h4>
         <ol style="line-height:1.6;margin-top:0">

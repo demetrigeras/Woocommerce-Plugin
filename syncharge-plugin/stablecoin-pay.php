@@ -1,9 +1,9 @@
 <?php
 /**
- * Plugin Name: Stablecoin Pay
- * Description: Accept cryptocurrency payments with Stablecoin Pay. Simple crypto payments for WooCommerce.
- * Version: 1.0.0
- * Author: Stablecoin Pay
+ * Plugin Name: Syncharge
+ * Description: Accept cryptocurrency payments with Syncharge. Simple crypto payments for WooCommerce.
+ * Version: 1.0.0.202608212013
+ * Author: Syncharge
  * License: GPL v2 or later
  * License URI: https://www.gnu.org/licenses/gpl-2.0.html
  * Text Domain: stablecoin-pay
@@ -24,7 +24,7 @@ if (!defined('ABSPATH')) {
 define('SP_PLUGIN_FILE', __FILE__);
 define('SP_PLUGIN_DIR', plugin_dir_path(__FILE__));
 define('SP_PLUGIN_URL', plugin_dir_url(__FILE__));
-define('SP_VERSION', '1.0.0');
+define('SP_VERSION', '1.0.0.202608212013');
 
 
 function sp_get_whitelabel_plugin_name() {
