@@ -779,6 +779,14 @@ class SP_Webhook_Provisioner {
      * way to clear it. So a failure that is contradicted by an actual registration
      * is discarded rather than shown.
      */
+    /**
+     * The current problem, if there is one.
+     *
+     * Only failures are ever stored, so this returns an empty array whenever things
+     * are working. Success is silence: registering the webhook is the expected
+     * outcome and does not deserve a banner, and anything persisted on the happy
+     * path would linger in the options table of every site that installs this.
+     */
     public static function status() {
         $status = get_option(self::OPTION_STATUS, array());
 
@@ -786,34 +794,17 @@ class SP_Webhook_Provisioner {
             return array();
         }
 
-        // Written by a build with different status semantics - do not render its text.
-        if ((int) (isset($status['schema']) ? $status['schema'] : 0) !== self::STATUS_SCHEMA) {
-            return self::resolve_stale_status();
-        }
+        // Written by a build with different status semantics, or contradicted by an
+        // actual registration. Either way the stored text is no longer evidence of
+        // a live problem, so drop it rather than showing it forever.
+        $stale_schema = (int) (isset($status['schema']) ? $status['schema'] : 0) !== self::STATUS_SCHEMA;
 
-        // A failure that the stored registration contradicts.
-        if ($status['state'] !== 'ok' && self::is_registered()) {
-            return self::resolve_stale_status();
+        if ($stale_schema || self::is_registered()) {
+            delete_option(self::OPTION_STATUS);
+            return array();
         }
 
         return $status;
-    }
-
-    /**
-     * Replace an untrustworthy status with one derived from actual state.
-     */
-    private static function resolve_stale_status() {
-        if (self::is_registered()) {
-            return self::record(
-                'ok',
-                sprintf('Webhook #%d is registered for this site.', self::webhook_id())
-            );
-        }
-
-        // Nothing registered and nothing trustworthy to report. Stay silent rather
-        // than showing an error whose wording came from a previous version.
-        delete_option(self::OPTION_STATUS);
-        return array();
     }
 
     /**
@@ -848,6 +839,16 @@ class SP_Webhook_Provisioner {
             'schema'     => self::STATUS_SCHEMA,
             'webhook_id' => self::webhook_id(),
         );
+
+        // Success, and "credentials not entered yet", are normal states. Storing
+        // them would leave a row behind on every install and risk it being rendered
+        // later as though it still meant something, so clear instead of persisting.
+        // The value is still returned for the caller that triggered the sync.
+        if ($state === 'ok' || $state === 'incomplete') {
+            delete_option(self::OPTION_STATUS);
+            return $status;
+        }
+
         update_option(self::OPTION_STATUS, $status, false);
         return $status;
     }

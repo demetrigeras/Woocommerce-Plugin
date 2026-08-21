@@ -23,8 +23,12 @@ class SP_Webhook_Admin {
     }
 
     /**
-     * Surface provisioning problems. Success is only announced once, right after
-     * a save, so a healthy site does not carry a permanent banner.
+     * Surface provisioning problems only.
+     *
+     * Registering the webhook is the expected outcome, so there is no success
+     * notice: a working site shows nothing at all. status() returns an empty array
+     * unless something is actually wrong right now, which also means a problem that
+     * later resolves stops being shown without anyone having to dismiss it.
      */
     public function render_notice() {
         if (!current_user_can('manage_woocommerce')) {
@@ -41,40 +45,15 @@ class SP_Webhook_Admin {
             return;
         }
 
-        $state   = $status['state'];
         $message = isset($status['message']) ? $status['message'] : '';
-
-        if ($state === 'ok') {
-            // Only on the gateway settings screen, and only for a few minutes
-            // after the save that produced it.
-            if (!$this->is_gateway_screen()) {
-                return;
-            }
-            if (empty($status['time']) || (time() - (int) $status['time']) > 5 * MINUTE_IN_SECONDS) {
-                return;
-            }
-            printf(
-                '<div class="notice notice-success is-dismissible"><p><strong>%s</strong> %s</p></div>',
-                esc_html__('Webhook ready.', 'stablecoin-pay'),
-                esc_html($message)
-            );
-            return;
-        }
-
-        // "incomplete" just means credentials have not been entered yet - that is
-        // not a failure worth shouting about outside the settings screen.
-        if ($state === 'incomplete' && !$this->is_gateway_screen()) {
-            return;
-        }
-
-        $class = ($state === 'unreachable' || $state === 'incomplete') ? 'notice-warning' : 'notice-error';
+        $class   = $status['state'] === 'unreachable' ? 'notice-warning' : 'notice-error';
 
         printf(
             '<div class="notice %1$s"><p><strong>%2$s</strong> %3$s</p>%4$s</div>',
             esc_attr($class),
             esc_html__('Payment webhook not registered.', 'stablecoin-pay'),
             esc_html($message),
-            $state === 'incomplete' ? '' : $this->retry_button()
+            $this->retry_button()
         );
     }
 
@@ -128,10 +107,4 @@ class SP_Webhook_Admin {
         exit;
     }
 
-    private function is_gateway_screen() {
-        if (!isset($_GET['page'], $_GET['section'])) {
-            return false;
-        }
-        return $_GET['page'] === 'wc-settings' && $_GET['section'] === 'sp';
-    }
 }

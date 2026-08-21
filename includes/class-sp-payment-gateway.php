@@ -360,18 +360,12 @@ class WC_Gateway_SP extends WC_Payment_Gateway {
                 'default' => '',
             ),
             'webhook_url' => array(
+                // Rendered as plain text, not an input: nothing here is editable and
+                // there is nothing to copy any more, so a form field would just
+                // invite people to change a value that is derived from the site.
                 'title' => __('Webhook URL', 'stablecoin-pay'),
-                'type' => 'text',
+                'type' => 'sp_readonly_url',
                 'description' => $this->get_webhook_destination_description(),
-                // Shown for reference only. Deliberately carries no secret: the old
-                // value embedded one as a query arg, which leaks it into access
-                // logs, browser history and referrer headers. Auto-provisioned
-                // webhooks authenticate with an HMAC signature instead.
-                'default' => class_exists('SP_Webhook_Provisioner')
-                    ? SP_Webhook_Provisioner::callback_url()
-                    : get_rest_url(null, SP_Webhook_Provisioner::CALLBACK_ROUTE),
-                'custom_attributes' => array('readonly' => 'readonly'),
-                'css' => 'background: #f0f0f0;',
             ),
             
         );
@@ -1800,6 +1794,48 @@ class WC_Gateway_SP extends WC_Payment_Gateway {
      * @return string
      */
     /**
+     * Render a derived, non-editable URL as plain text rather than a form input.
+     *
+     * WC_Settings_API dispatches on field type, so declaring the field as
+     * `sp_readonly_url` routes it here.
+     *
+     * @param string $key
+     * @param array  $data
+     * @return string
+     */
+    public function generate_sp_readonly_url_html($key, $data) {
+        $data = wp_parse_args($data, array('title' => '', 'description' => ''));
+
+        ob_start();
+        ?>
+        <tr valign="top">
+            <th scope="row" class="titledesc"><?php echo wp_kses_post($data['title']); ?></th>
+            <td class="forminp">
+                <code style="display:inline-block;padding:6px 10px;background:#f0f0f1;border-radius:3px;word-break:break-all;"><?php
+                    echo esc_html($this->get_option('webhook_url'));
+                ?></code>
+                <?php if (!empty($data['description'])) : ?>
+                    <p class="description"><?php echo wp_kses_post($data['description']); ?></p>
+                <?php endif; ?>
+            </td>
+        </tr>
+        <?php
+        return ob_get_clean();
+    }
+
+    /**
+     * Nothing is posted for the read-only URL row, and the value is derived on
+     * read anyway, so keep it out of the saved settings entirely.
+     *
+     * @param string $key
+     * @param mixed  $value
+     * @return string
+     */
+    public function validate_sp_readonly_url_field($key, $value) {
+        return '';
+    }
+
+    /**
      * The webhook URL is derived from the site, never stored.
      *
      * Older builds saved it with the shared secret appended as `?secret=...`, so a
@@ -1823,21 +1859,14 @@ class WC_Gateway_SP extends WC_Payment_Gateway {
 
     public function get_webhook_destination_description() {
         // The plugin registers this URL itself when settings are saved, so there is
-        // nothing for the merchant to copy. Report what actually happened instead.
-        $status = class_exists('SP_Webhook_Provisioner') ? SP_Webhook_Provisioner::status() : array();
-        $state  = isset($status['state']) ? $status['state'] : '';
-
+        // nothing for the merchant to copy. Say so, and stay quiet unless something
+        // is actually wrong - a working webhook needs no confirmation banner.
         $intro = __('Registered automatically when you save these settings &mdash; no dashboard setup needed. This URL receives payment confirmations and moves orders to "Processing" when payment completes.', 'stablecoin-pay');
 
-        if ($state === 'ok') {
-            $webhook_id = SP_Webhook_Provisioner::webhook_id();
-            return $intro . '<br><strong style="color:#1a7f37;">&#10003; '
-                 . esc_html__('Registered', 'stablecoin-pay') . '</strong>'
-                 . ($webhook_id ? ' <code>#' . esc_html($webhook_id) . '</code>' : '');
-        }
+        $status = class_exists('SP_Webhook_Provisioner') ? SP_Webhook_Provisioner::status() : array();
 
-        if ($state !== '' && !empty($status['message'])) {
-            $colour = ($state === 'unreachable' || $state === 'incomplete') ? '#b26200' : '#b32d2e';
+        if (!empty($status['message'])) {
+            $colour = (isset($status['state']) && $status['state'] === 'unreachable') ? '#b26200' : '#b32d2e';
             return $intro . '<br><strong style="color:' . esc_attr($colour) . ';">'
                  . esc_html($status['message']) . '</strong>';
         }

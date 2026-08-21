@@ -611,13 +611,11 @@ $GLOBALS['options']['sp_webhook_signing_secret'] = 'whsec_live';
 
 $s = SP_Webhook_Provisioner::status();
 check('an old-build error is not shown once a webhook is registered',
-    ($s['state'] ?? '') === 'ok', json_encode($s));
+    $s === array(), json_encode($s));
 check('  -> the stale wording is gone',
     strpos(json_encode($s), 'did not return a webhook id') === false, json_encode($s));
-check('  -> replaced status is stamped with the current schema',
-    ($s['schema'] ?? 0) === SP_Webhook_Provisioner::STATUS_SCHEMA);
-check('  -> and persisted, so it does not re-derive every load',
-    ($GLOBALS['options']['sp_webhook_provision_status']['state'] ?? '') === 'ok');
+check('  -> and the row is deleted, not rewritten',
+    !isset($GLOBALS['options']['sp_webhook_provision_status']));
 
 // Old-build error, and nothing is actually registered -> stay silent rather than
 // showing wording from a previous version.
@@ -651,7 +649,7 @@ $GLOBALS['options']['sp_webhook_provision_status'] = array(
 );
 $s = SP_Webhook_Provisioner::status();
 check('a failure contradicted by a live registration is discarded',
-    ($s['state'] ?? '') === 'ok', json_encode($s));
+    $s === array(), json_encode($s));
 
 // is_registered needs BOTH id and secret - an id alone cannot verify deliveries.
 reset_state();
@@ -672,6 +670,71 @@ check('dismissing flags the stored status', !empty(SP_Webhook_Provisioner::statu
 SP_Webhook_Provisioner::sync(); // fails again -> fresh record
 check('a subsequent failure clears the dismissal and shows again',
     empty(SP_Webhook_Provisioner::status()['dismissed']));
+
+// ================================= 15. Success is silent and leaves nothing behind
+section('15. Nothing is persisted or shown on the happy path');
+
+// A clean registration must leave no row in the options table at all.
+reset_state();
+$GLOBALS['api'] = function ($method, $url) {
+    if ($method === 'GET') { return json_reply(200, array('webhooks' => array())); }
+    return json_reply(200, array('webhook_id' => 900, 'signing_secret' => 'whsec_quiet'));
+};
+$r = SP_Webhook_Provisioner::sync();
+check('sync still reports success to its caller', ($r['state'] ?? '') === 'ok', json_encode($r));
+check('  -> but stores NO status row', !isset($GLOBALS['options']['sp_webhook_provision_status']),
+    json_encode($GLOBALS['options']['sp_webhook_provision_status'] ?? null));
+check('  -> and status() is empty, so no notice renders', SP_Webhook_Provisioner::status() === array());
+check('  -> the webhook itself is still recorded', SP_Webhook_Provisioner::webhook_id() === 900);
+
+// "Credentials not entered yet" is a normal state on a fresh install, not a problem.
+reset_state();
+$GLOBALS['options']['woocommerce_sp_settings']['api_key'] = '';
+$r = SP_Webhook_Provisioner::sync();
+check('missing credentials is reported to the caller', ($r['state'] ?? '') === 'incomplete');
+check('  -> but nothing is stored for a fresh install',
+    !isset($GLOBALS['options']['sp_webhook_provision_status']));
+check('  -> so a new download shows no banner', SP_Webhook_Provisioner::status() === array());
+
+// A failure that later succeeds must stop showing, with no dismissal needed.
+reset_state();
+$fail = true;
+$GLOBALS['api'] = function ($method, $url) use (&$fail) {
+    if ($method === 'GET') { return json_reply(200, array('webhooks' => array())); }
+    if ($fail) { return json_reply(500, array('message' => 'temporarily down')); }
+    return json_reply(200, array('webhook_id' => 901, 'signing_secret' => 'whsec_after'));
+};
+SP_Webhook_Provisioner::sync();
+check('a failure is stored while it is real', (SP_Webhook_Provisioner::status()['state'] ?? '') === 'error');
+$fail = false;
+SP_Webhook_Provisioner::sync();
+check('  -> and clears itself once the retry succeeds',
+    SP_Webhook_Provisioner::status() === array(), json_encode(SP_Webhook_Provisioner::status()));
+check('  -> leaving no row behind', !isset($GLOBALS['options']['sp_webhook_provision_status']));
+
+// The reported case: a stale success row from an older build must vanish, not show.
+reset_state();
+$GLOBALS['options']['sp_webhook_provision_status'] = array(
+    'state' => 'ok', 'message' => 'Registered #176', 'time' => time() - 60, 'schema' => 1,
+);
+$GLOBALS['options']['sp_webhook_id'] = 176;
+$GLOBALS['options']['sp_webhook_signing_secret'] = 'whsec_old';
+check('a leftover success row from an older build is not rendered',
+    SP_Webhook_Provisioner::status() === array());
+check('  -> and is deleted rather than left lying around',
+    !isset($GLOBALS['options']['sp_webhook_provision_status']));
+
+// Only genuine, current problems survive.
+reset_state();
+$GLOBALS['api'] = function ($method, $url) {
+    if ($method === 'GET') { return json_reply(200, array('webhooks' => array())); }
+    return json_reply(500, array('message' => 'still broken'));
+};
+SP_Webhook_Provisioner::sync();
+$s = SP_Webhook_Provisioner::status();
+check('a real, unresolved failure is still shown', ($s['state'] ?? '') === 'error', json_encode($s));
+check('  -> and is stamped with the current schema',
+    ($s['schema'] ?? 0) === SP_Webhook_Provisioner::STATUS_SCHEMA);
 
 // ===================================================================== summary
 echo "\n" . str_repeat('=', 62) . "\n";
