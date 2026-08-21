@@ -1,0 +1,17 @@
+{
+  "name": "stablecoin-pay-blocks",
+  "version": "1.0.0",
+  "description": "WooCommerce Blocks payment-method integration for  Pay.",
+  "private": true,
+  "scripts": {
+    "build": "wp-scripts build src/blocks/index.js --output-path=build",
+    "start": "wp-scripts start src/blocks/index.js --output-path=build",
+    "lint:js": "wp-scripts lint-js src/blocks"
+  },
+  "devDependencies": {
+    "@wordpress/scripts": "^27.0.0"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}

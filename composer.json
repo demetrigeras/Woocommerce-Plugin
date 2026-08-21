@@ -1,0 +1,22 @@
+{
+    "name": "stablecoin-pay/stablecoin-pay",
+    "description": "WordPress WooCommerce plugin for cryptocurrency payments",
+    "type": "wordpress-plugin",
+    "require": {
+        "php": ">=7.4"
+    },
+    "require-dev": {
+        "squizlabs/php_codesniffer": "^3.7",
+        "wp-coding-standards/wpcs": "^2.3"
+    },
+    "scripts": {
+        "phpcs": "phpcs --standard=.phpcs.xml",
+        "phpcbf": "phpcbf --standard=.phpcs.xml"
+    },
+    "config": {
+        "allow-plugins": {
+            "dealerdirect/phpcodesniffer-composer-installer": true
+        }
+    }
+}
+

@@ -1,0 +1,16 @@
+# Build artifacts - create-plugin-package.sh writes zips then removes them
+*.zip
+
+# Build temp dirs (script creates and deletes, but ignore in case of interruption)
+stablecoin-pay-plugin/
+payment-servers-plugin/
+
+# Node tooling for the WooCommerce Blocks integration
+node_modules/
+
+# NOTE: `build/` is intentionally NOT ignored — we commit the compiled JS
+# bundle so the plugin works out-of-the-box without running npm install.
+
+# OS
+.DS_Store
+Thumbs.db

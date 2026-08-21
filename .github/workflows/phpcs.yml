@@ -1,0 +1,45 @@
+name: WordPress Coding Standards
+
+on:
+  push:
+    branches: [ main, master, develop ]
+  pull_request:
+    branches: [ main, master, develop ]
+
+jobs:
+  phpcs:
+    name: PHP_CodeSniffer
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v3
+
+    - name: Setup PHP
+      uses: shivammathur/setup-php@v2
+      with:
+        php-version: '8.0'
+        tools: composer
+        coverage: none
+
+    - name: Allow Composer Plugin
+      run: |
+        composer global config --no-plugins allow-plugins.dealerdirect/phpcodesniffer-composer-installer true
+
+    # WPCS pulls in PHP_CodeSniffer (^3.13.5), PHPCSUtils and PHPCSExtra itself, and the
+    # composer installer plugin allowed above registers all of them with phpcs, so there is
+    # no separate phpcs install or installed_paths step. 3.4.1 is the first release not
+    # affected by CVE-2026-45293; anything lower is blocked by Composer's advisory policy.
+    - name: Install WordPress Coding Standards
+      run: |
+        composer global require wp-coding-standards/wpcs:"^3.4.1" --no-interaction --prefer-dist
+
+    - name: Run PHPCS (Report Only)
+      working-directory: ${{ github.workspace }}
+      continue-on-error: true
+      run: |
+        echo "Running WordPress Coding Standards check (WordPress-Core standard)..."
+        echo "Excluding test files and backups..."
+        $HOME/.composer/vendor/bin/phpcs --standard=WordPress-Core --report=summary --extensions=php --ignore=vendor,node_modules,*.min.js,*.min.css,*.zip,test-*.php,*backup*.php,webhook-logger.php --runtime-set text_domain stablecoin-pay . || true
+        echo ""
+        echo "💡 This is a report only - doesn't block pushes."
