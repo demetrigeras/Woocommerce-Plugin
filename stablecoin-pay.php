@@ -208,12 +208,18 @@ function sp_register_review_rewrite_rule() {
 }
 
 function sp_commerce_activate() {
-    // Add rewrite rules for webhook endpoint
-    add_rewrite_rule(
-        '^wp-json/stablecoin/v1/webhook/?$',
-        'index.php?sp_webhook=1',
-        'top'
-    );
+    // Add rewrite rules for the webhook endpoint, canonical and legacy namespaces
+    // alike, so a merchant whose dashboard still holds an older callback URL keeps
+    // resolving. (WordPress serves /wp-json/ directly; these rules only matter on
+    // installs where that path is not already routed.)
+    require_once SP_PLUGIN_DIR . 'includes/class-sp-webhook-provisioner.php';
+    foreach (SP_Webhook_Provisioner::all_namespaces() as $sp_namespace) {
+        add_rewrite_rule(
+            '^wp-json/' . preg_quote($sp_namespace, '/') . '/webhook/?$',
+            'index.php?sp_webhook=1',
+            'top'
+        );
+    }
 
     // Add rewrite for the review/branding explainer page
     sp_register_review_rewrite_rule();

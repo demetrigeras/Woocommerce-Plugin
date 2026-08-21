@@ -32,19 +32,24 @@ class SP_Webhook_Handler {
      * Register webhook endpoint with WordPress REST API
      */
     public function register_webhook_endpoint() {
-        // Main webhook endpoint
-        register_rest_route('stablecoin/v1', '/webhook', array(
-            'methods' => 'POST',
-            'callback' => array($this, 'handle_webhook'),
-            'permission_callback' => '__return_true', // Allow public access
-        ));
-        
-        // Test endpoint to verify webhook is accessible
-        register_rest_route('stablecoin/v1', '/webhook/test', array(
-            'methods' => 'GET',
-            'callback' => array($this, 'test_webhook_endpoint'),
-            'permission_callback' => '__return_true',
-        ));
+        // Every namespace is served identically. The first is canonical and is what
+        // new registrations point at; the rest are kept alive so merchants whose
+        // dashboard still holds an older callback URL keep receiving deliveries.
+        // Do not drop a legacy namespace until no webhook points at it.
+        foreach (SP_Webhook_Provisioner::all_namespaces() as $namespace) {
+            register_rest_route($namespace, '/webhook', array(
+                'methods' => 'POST',
+                'callback' => array($this, 'handle_webhook'),
+                'permission_callback' => '__return_true', // Allow public access
+            ));
+
+            // Test endpoint to verify webhook is accessible
+            register_rest_route($namespace, '/webhook/test', array(
+                'methods' => 'GET',
+                'callback' => array($this, 'test_webhook_endpoint'),
+                'permission_callback' => '__return_true',
+            ));
+        }
     }
     
     /**
@@ -55,7 +60,7 @@ class SP_Webhook_Handler {
         return new WP_REST_Response(array(
             'status' => 'success',
             'message' => 'Stablecoin Pay webhook endpoint is working!',
-            'endpoint' => rest_url('stablecoin/v1/webhook'),
+            'endpoint' => rest_url(SP_Webhook_Provisioner::CALLBACK_ROUTE),
             'timestamp' => current_time('mysql')
         ), 200);
     }

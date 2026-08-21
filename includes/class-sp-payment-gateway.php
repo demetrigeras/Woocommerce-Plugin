@@ -369,7 +369,7 @@ class WC_Gateway_SP extends WC_Payment_Gateway {
                 // webhooks authenticate with an HMAC signature instead.
                 'default' => class_exists('SP_Webhook_Provisioner')
                     ? SP_Webhook_Provisioner::callback_url()
-                    : get_rest_url(null, 'stablecoin/v1/webhook'),
+                    : get_rest_url(null, SP_Webhook_Provisioner::CALLBACK_ROUTE),
                 'custom_attributes' => array('readonly' => 'readonly'),
                 'css' => 'background: #f0f0f0;',
             ),
@@ -1815,7 +1815,7 @@ class WC_Gateway_SP extends WC_Payment_Gateway {
         if ($key === 'webhook_url') {
             return class_exists('SP_Webhook_Provisioner')
                 ? SP_Webhook_Provisioner::callback_url()
-                : get_rest_url(null, 'stablecoin/v1/webhook');
+                : get_rest_url(null, SP_Webhook_Provisioner::CALLBACK_ROUTE);
         }
 
         return parent::get_option($key, $empty_value);

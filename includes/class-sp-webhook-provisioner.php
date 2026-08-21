@@ -33,8 +33,55 @@ class SP_Webhook_Provisioner {
     /** Last provisioning outcome, surfaced as an admin notice. */
     const OPTION_STATUS = 'sp_webhook_provision_status';
 
-    /** REST namespace/route this plugin actually registers. */
-    const CALLBACK_ROUTE = 'stablecoin/v1/webhook';
+    /**
+     * Status-record version. Bump whenever the stored message wording or the set of
+     * states changes, so notices written by an older build are re-derived instead of
+     * being shown verbatim forever.
+     */
+    const STATUS_SCHEMA = 2;
+
+    /**
+     * Canonical REST namespace for the callback.
+     *
+     * "woowh" = WooCommerce webhook. Deliberately generic: this path is visible to
+     * merchants and partners, so it carries no company or product name.
+     */
+    const NAMESPACE_CURRENT = 'woowh/v1';
+
+    /**
+     * Namespaces kept alive purely for compatibility.
+     *
+     * A merchant's dashboard holds whatever callback URL was registered at the
+     * time, so retiring one of these silently 404s their deliveries. sync() moves
+     * them onto the canonical namespace via PUT; only remove an entry once nothing
+     * points at it any more.
+     */
+    const NAMESPACES_LEGACY = array('stablecoin/v1');
+
+    /** Canonical route, relative to /wp-json/. */
+    const CALLBACK_ROUTE = self::NAMESPACE_CURRENT . '/webhook';
+
+    /**
+     * Canonical namespace first, then legacy ones. The handler registers each.
+     *
+     * @return string[]
+     */
+    public static function all_namespaces() {
+        return array_merge(array(self::NAMESPACE_CURRENT), self::NAMESPACES_LEGACY);
+    }
+
+    /**
+     * Callback URLs this site answers on but no longer advertises.
+     *
+     * @return string[]
+     */
+    public static function legacy_callback_urls() {
+        $urls = array();
+        foreach (self::NAMESPACES_LEGACY as $namespace) {
+            $urls[] = get_rest_url(null, $namespace . '/webhook');
+        }
+        return $urls;
+    }
 
     const HTTP_TIMEOUT = 15;
 
@@ -136,7 +183,15 @@ class SP_Webhook_Provisioner {
             return self::update_url($existing['ours'], $callback_url, $credentials);
         }
 
-        // 4. Nothing to reuse - create.
+        // 4. A webhook still points at a retired namespace on this same site.
+        //    Repoint it, so the merchant migrates without any manual step and
+        //    without ending up with two webhooks delivering the same events.
+        if ($existing['legacy']) {
+            error_log('PP Webhook Provisioner: migrating webhook from a legacy callback path to ' . $callback_url);
+            return self::update_url($existing['legacy'], $callback_url, $credentials);
+        }
+
+        // 5. Nothing to reuse - create.
         return self::create($callback_url, $credentials);
     }
 
@@ -145,10 +200,20 @@ class SP_Webhook_Provisioner {
      * the one we previously created (by stored id) whose URL may have drifted.
      */
     private static function find_existing($callback_url, $credentials) {
-        $result = array('match' => null, 'ours' => null);
+        $result = array('match' => null, 'ours' => null, 'legacy' => null);
+        $legacy_urls = self::legacy_callback_urls();
 
         $response = self::request('GET', 'webhooks', null, $credentials);
         $webhooks = self::extract_list($response);
+
+        if ($webhooks === null) {
+            // We cannot tell what already exists, so creating would risk a duplicate
+            // on every save. Stop instead, and report the shape so it can be fixed.
+            throw new Exception(
+                'Could not read the webhook list from the API, so no webhook was created (creating blindly risks duplicates). '
+                . 'Contact support with this shape: ' . self::describe_shape($response)
+            );
+        }
 
         $stored_id = (int) get_option(self::OPTION_WEBHOOK_ID, 0);
 
@@ -156,7 +221,7 @@ class SP_Webhook_Provisioner {
             if (!is_array($webhook)) {
                 continue;
             }
-            $id  = isset($webhook['webhook_id']) ? (int) $webhook['webhook_id'] : (isset($webhook['id']) ? (int) $webhook['id'] : 0);
+            $id  = self::extract_id($webhook);
             $url = isset($webhook['url']) ? (string) $webhook['url'] : '';
 
             if ($url !== '' && self::same_url($url, $callback_url)) {
@@ -164,6 +229,18 @@ class SP_Webhook_Provisioner {
             }
             if ($stored_id && $id === $stored_id) {
                 $result['ours'] = $webhook;
+            }
+
+            // Registered against a namespace this site still answers on, but no
+            // longer advertises. Move it rather than leaving a second webhook
+            // delivering to the old path.
+            if ($url !== '' && $result['legacy'] === null) {
+                foreach ($legacy_urls as $legacy_url) {
+                    if (self::same_url($url, $legacy_url)) {
+                        $result['legacy'] = $webhook;
+                        break;
+                    }
+                }
             }
         }
 
@@ -179,7 +256,7 @@ class SP_Webhook_Provisioner {
      * must rotate to get a usable one.
      */
     private static function adopt($webhook, $callback_url, $credentials) {
-        $webhook_id = isset($webhook['webhook_id']) ? (int) $webhook['webhook_id'] : (int) ($webhook['id'] ?? 0);
+        $webhook_id = self::extract_id($webhook);
         if (!$webhook_id) {
             return self::fail('error', 'The API returned a webhook without an id. Contact support.');
         }
@@ -195,7 +272,7 @@ class SP_Webhook_Provisioner {
 
         if (self::signing_secret() === '') {
             $rotated = self::request('POST', 'webhooks/' . $webhook_id . '/rotate-secret', null, $credentials);
-            $secret  = isset($rotated['signing_secret']) ? (string) $rotated['signing_secret'] : '';
+            $secret  = self::extract_secret($rotated);
             if ($secret === '') {
                 return self::fail('error', 'Reused an existing webhook but could not obtain a signing secret. Contact support.');
             }
@@ -207,7 +284,7 @@ class SP_Webhook_Provisioner {
     }
 
     private static function update_url($webhook, $callback_url, $credentials) {
-        $webhook_id = isset($webhook['webhook_id']) ? (int) $webhook['webhook_id'] : (int) ($webhook['id'] ?? 0);
+        $webhook_id = self::extract_id($webhook);
         if (!$webhook_id) {
             return self::create($callback_url, $credentials);
         }
@@ -222,8 +299,9 @@ class SP_Webhook_Provisioner {
         // but never captured a secret still needs one.
         if (self::signing_secret() === '') {
             $rotated = self::request('POST', 'webhooks/' . $webhook_id . '/rotate-secret', null, $credentials);
-            if (!empty($rotated['signing_secret'])) {
-                self::store_secret((string) $rotated['signing_secret']);
+            $recovered = self::extract_secret($rotated);
+            if ($recovered !== '') {
+                self::store_secret($recovered);
             }
         }
 
@@ -231,28 +309,97 @@ class SP_Webhook_Provisioner {
     }
 
     private static function create($callback_url, $credentials) {
-        $response = self::request('POST', 'webhooks', array(
-            'url'                    => $callback_url,
-            'subscribed_event_types' => self::event_types(),
-        ), $credentials);
-
-        $webhook_id = isset($response['webhook_id']) ? (int) $response['webhook_id'] : 0;
-        $secret     = isset($response['signing_secret']) ? (string) $response['signing_secret'] : '';
-
-        if (!$webhook_id) {
-            return self::fail('error', 'The API did not return a webhook id. Contact support.');
+        try {
+            $response = self::request('POST', 'webhooks', array(
+                'url'                    => $callback_url,
+                'subscribed_event_types' => self::event_types(),
+            ), $credentials);
+        } catch (Exception $e) {
+            // The create may well have landed server-side even though we never saw a
+            // usable reply - a read timeout, a dropped connection, a proxy 502. Ask
+            // the API what exists before declaring failure, so we neither lose a
+            // webhook that was created nor create a second one on the next save.
+            $recovered = self::recover_created($callback_url, $credentials, 'create failed: ' . $e->getMessage());
+            if ($recovered) {
+                return $recovered;
+            }
+            throw $e;
         }
 
-        // This is the only response that will ever carry the secret.
-        if ($secret === '') {
-            return self::fail('error', 'The API did not return a signing secret. Contact support.');
+        $webhook_id = self::extract_id($response);
+        $secret     = self::extract_secret($response);
+
+        if (!$webhook_id) {
+            // A 2xx we cannot read - an empty 201 body, or a shape the spec did not
+            // describe. The webhook is very likely to exist, so confirm rather than
+            // reporting a failure the merchant cannot act on.
+            $recovered = self::recover_created(
+                $callback_url,
+                $credentials,
+                'create returned no readable id; shape was ' . self::describe_shape($response)
+            );
+            if ($recovered) {
+                return $recovered;
+            }
+
+            return self::fail(
+                'error',
+                'The API accepted the webhook but returned no id we recognise, and no matching webhook was found afterwards. '
+                . 'Check your dashboard before retrying. Contact support with this shape: '
+                . self::describe_shape($response)
+            );
         }
 
         update_option(self::OPTION_WEBHOOK_ID, $webhook_id, false);
         update_option(self::OPTION_REGISTERED_URL, $callback_url, false);
+
+        // The create response is normally the only one that carries the secret. If
+        // this API returns it separately, recover it rather than failing and
+        // leaving an orphaned webhook behind.
+        if ($secret === '') {
+            error_log('PP Webhook Provisioner: create returned no signing secret; shape was ' . self::describe_shape($response));
+            $rotated = self::request('POST', 'webhooks/' . $webhook_id . '/rotate-secret', null, $credentials);
+            $secret  = self::extract_secret($rotated);
+            if ($secret === '') {
+                return self::fail(
+                    'error',
+                    'Webhook #' . $webhook_id . ' was created but no signing secret could be obtained, so deliveries cannot be verified. Contact support.'
+                );
+            }
+        }
+
         self::store_secret($secret);
 
         return self::ok('Webhook registered automatically. No dashboard setup needed.');
+    }
+
+    /**
+     * After a create whose outcome we could not read, ask the API what actually
+     * exists and adopt the webhook if it is there.
+     *
+     * This is what turns "the webhook was created but the plugin reported an
+     * error" into a clean success, and it is also what stops a retry from creating
+     * a duplicate.
+     *
+     * @return array|null Status array when recovered, null when there is nothing
+     *                    to adopt (caller then reports the original failure).
+     */
+    private static function recover_created($callback_url, $credentials, $why) {
+        error_log('PP Webhook Provisioner: verifying after unreadable create - ' . $why);
+
+        try {
+            $existing = self::find_existing($callback_url, $credentials);
+        } catch (Exception $e) {
+            error_log('PP Webhook Provisioner: verification lookup failed - ' . $e->getMessage());
+            return null;
+        }
+
+        if (empty($existing['match'])) {
+            return null;
+        }
+
+        error_log('PP Webhook Provisioner: webhook does exist after all - adopting it');
+        return self::adopt($existing['match'], $callback_url, $credentials);
     }
 
     // -------------------------------------------------------------------- HTTP
@@ -353,19 +500,135 @@ class SP_Webhook_Provisioner {
     /**
      * The list endpoint may return a bare array or wrap it in a key.
      */
+    /**
+     * @return array|null Array of webhooks, or NULL when the shape is unrecognised.
+     *
+     * The null case matters: "no webhooks" and "I could not read the response" must
+     * not look the same, because the first means create one and the second means we
+     * have no idea what exists. Treating them alike would POST a fresh webhook on
+     * every settings save.
+     */
     private static function extract_list($response) {
+        if (!is_array($response)) {
+            return null;
+        }
+
+        // Already a bare list.
+        if ($response === array()) {
+            return array();
+        }
+        if (array_keys($response) === range(0, count($response) - 1)) {
+            return $response;
+        }
+
+        foreach (array('webhooks', 'data', 'results', 'items', 'records') as $key) {
+            if (array_key_exists($key, $response)) {
+                $inner = $response[$key];
+                if (is_array($inner)) {
+                    // A single object rather than a list.
+                    if ($inner !== array() && array_keys($inner) !== range(0, count($inner) - 1)) {
+                        return array($inner);
+                    }
+                    return $inner;
+                }
+                if ($inner === null) {
+                    return array(); // Explicit "none".
+                }
+            }
+        }
+
+        // A lone webhook object returned directly.
+        if (self::extract_id($response)) {
+            return array($response);
+        }
+
+        return null;
+    }
+
+    /**
+     * Pull a webhook id out of a response, tolerating envelopes and id naming.
+     */
+    private static function extract_id($response) {
+        foreach (self::candidates($response) as $node) {
+            foreach (array('webhook_id', 'webhookId', 'id', 'ID') as $key) {
+                if (isset($node[$key]) && (is_int($node[$key]) || is_string($node[$key])) && (int) $node[$key] > 0) {
+                    return (int) $node[$key];
+                }
+            }
+        }
+        return 0;
+    }
+
+    private static function extract_secret($response) {
+        foreach (self::candidates($response) as $node) {
+            foreach (array('signing_secret', 'signingSecret', 'secret') as $key) {
+                if (!empty($node[$key]) && is_string($node[$key])) {
+                    return $node[$key];
+                }
+            }
+        }
+        return '';
+    }
+
+    /**
+     * The response itself plus one level of common envelopes, so a payload nested
+     * under data/webhook/result is still readable.
+     */
+    private static function candidates($response) {
         if (!is_array($response)) {
             return array();
         }
-        if (isset($response[0])) {
-            return $response;
-        }
-        foreach (array('webhooks', 'data', 'results', 'items') as $key) {
+
+        $nodes = array($response);
+        foreach (array('data', 'webhook', 'result', 'payload') as $key) {
             if (isset($response[$key]) && is_array($response[$key])) {
-                return $response[$key];
+                $nodes[] = $response[$key];
             }
         }
-        return array();
+        return $nodes;
+    }
+
+    /**
+     * Render a response's structure for logging, without its values.
+     *
+     * Create and rotate responses carry the signing secret, so values are shown
+     * only for a small allow-list of diagnostic keys; everything else reports its
+     * type and length.
+     */
+    private static function describe_shape($value, $depth = 0) {
+        if ($depth > 4) {
+            return '...';
+        }
+
+        if (is_array($value)) {
+            if ($value === array()) {
+                return '[]';
+            }
+            if (array_keys($value) === range(0, count($value) - 1)) {
+                return '[' . count($value) . ' x ' . self::describe_shape($value[0], $depth + 1) . ']';
+            }
+            $parts = array();
+            foreach ($value as $key => $item) {
+                $parts[] = $key . ':' . self::describe_shape($item, $depth + 1, $key);
+            }
+            return '{' . implode(', ', $parts) . '}';
+        }
+
+        if (is_bool($value))  { return $value ? 'true' : 'false'; }
+        if (is_int($value))   { return 'int(' . $value . ')'; }
+        if (is_float($value)) { return 'float'; }
+        if ($value === null)  { return 'null'; }
+
+        if (is_string($value)) {
+            $safe_keys = array('message', 'status', 'url', 'error', 'detail', 'type', 'state');
+            $key = func_num_args() > 2 ? func_get_arg(2) : null;
+            if ($key !== null && in_array(strtolower((string) $key), $safe_keys, true)) {
+                return '"' . substr($value, 0, 80) . '"';
+            }
+            return 'string(' . strlen($value) . ')';
+        }
+
+        return gettype($value);
     }
 
     // ----------------------------------------------------------------- helpers
@@ -496,9 +759,76 @@ class SP_Webhook_Provisioner {
         return (int) get_option(self::OPTION_WEBHOOK_ID, 0);
     }
 
+    /**
+     * True when this site holds everything needed to receive and verify deliveries.
+     *
+     * This is the ground truth. A stored status message is only a record of what
+     * happened last time - if it disagrees with this, it is out of date.
+     */
+    public static function is_registered() {
+        return self::webhook_id() > 0 && self::signing_secret() !== '';
+    }
+
+    /**
+     * Last provisioning outcome, re-validated before it is trusted.
+     *
+     * A stored failure is not evidence of a current problem. It can outlive the
+     * thing it described: a later attempt succeeded, or the message was written by
+     * an older build whose wording and semantics no longer apply. Rendering it
+     * anyway leaves merchants staring at an error for a webhook that works, with no
+     * way to clear it. So a failure that is contradicted by an actual registration
+     * is discarded rather than shown.
+     */
     public static function status() {
         $status = get_option(self::OPTION_STATUS, array());
-        return is_array($status) ? $status : array();
+
+        if (!is_array($status) || empty($status['state'])) {
+            return array();
+        }
+
+        // Written by a build with different status semantics - do not render its text.
+        if ((int) (isset($status['schema']) ? $status['schema'] : 0) !== self::STATUS_SCHEMA) {
+            return self::resolve_stale_status();
+        }
+
+        // A failure that the stored registration contradicts.
+        if ($status['state'] !== 'ok' && self::is_registered()) {
+            return self::resolve_stale_status();
+        }
+
+        return $status;
+    }
+
+    /**
+     * Replace an untrustworthy status with one derived from actual state.
+     */
+    private static function resolve_stale_status() {
+        if (self::is_registered()) {
+            return self::record(
+                'ok',
+                sprintf('Webhook #%d is registered for this site.', self::webhook_id())
+            );
+        }
+
+        // Nothing registered and nothing trustworthy to report. Stay silent rather
+        // than showing an error whose wording came from a previous version.
+        delete_option(self::OPTION_STATUS);
+        return array();
+    }
+
+    /**
+     * Hide the current notice until something changes.
+     *
+     * Only suppresses the message that is showing now: any later record() writes a
+     * fresh status without the flag, so a new problem is surfaced again.
+     */
+    public static function dismiss_status() {
+        $status = get_option(self::OPTION_STATUS, array());
+        if (!is_array($status) || empty($status['state'])) {
+            return;
+        }
+        $status['dismissed'] = true;
+        update_option(self::OPTION_STATUS, $status, false);
     }
 
     private static function ok($message) {
@@ -512,9 +842,11 @@ class SP_Webhook_Provisioner {
 
     private static function record($state, $message) {
         $status = array(
-            'state'   => $state,
-            'message' => $message,
-            'time'    => time(),
+            'state'      => $state,
+            'message'    => $message,
+            'time'       => time(),
+            'schema'     => self::STATUS_SCHEMA,
+            'webhook_id' => self::webhook_id(),
         );
         update_option(self::OPTION_STATUS, $status, false);
         return $status;

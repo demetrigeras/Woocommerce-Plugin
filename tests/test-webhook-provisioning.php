@@ -112,7 +112,7 @@ function invoke($obj, $method, $args) {
 section('1. Callback URL is derived from the site, not the merchant');
 reset_state();
 check('uses the plugin\'s real REST namespace (stablecoin/v1, not coinsub/v1)',
-    SP_Webhook_Provisioner::callback_url() === 'https://shop.example.com/wp-json/stablecoin/v1/webhook',
+    SP_Webhook_Provisioner::callback_url() === 'https://shop.example.com/wp-json/woowh/v1/webhook',
     SP_Webhook_Provisioner::callback_url());
 
 // ============================================================= 2. Fresh create
@@ -144,7 +144,7 @@ $GLOBALS['http_log'] = array();
 $GLOBALS['api'] = function ($method, $url) {
     if ($method === 'GET') {
         return json_reply(200, array('webhooks' => array(
-            array('webhook_id' => 123, 'url' => 'https://shop.example.com/wp-json/stablecoin/v1/webhook', 'status' => 'active'),
+            array('webhook_id' => 123, 'url' => 'https://shop.example.com/wp-json/woowh/v1/webhook', 'status' => 'active'),
         )));
     }
     return json_reply(500, array('message' => 'should not have been called'));
@@ -163,7 +163,7 @@ $GLOBALS['options']['sp_webhook_signing_secret'] = 'whsec_abc123';
 $GLOBALS['api'] = function ($method, $url) {
     if ($method === 'GET') {
         return json_reply(200, array('webhooks' => array(
-            array('webhook_id' => 123, 'url' => 'https://oldshop.example.com/wp-json/stablecoin/v1/webhook', 'status' => 'active'),
+            array('webhook_id' => 123, 'url' => 'https://oldshop.example.com/wp-json/woowh/v1/webhook', 'status' => 'active'),
         )));
     }
     if ($method === 'PUT') { return json_reply(200, array('message' => 'Webhook updated')); }
@@ -181,7 +181,7 @@ reset_state();
 $GLOBALS['api'] = function ($method, $url) {
     if ($method === 'GET') {
         return json_reply(200, array('webhooks' => array(
-            array('webhook_id' => 77, 'url' => 'https://shop.example.com/wp-json/stablecoin/v1/webhook', 'status' => 'active'),
+            array('webhook_id' => 77, 'url' => 'https://shop.example.com/wp-json/woowh/v1/webhook', 'status' => 'active'),
         )));
     }
     if ($method === 'POST' && str_ends_with($url, '/rotate-secret')) {
@@ -339,6 +339,339 @@ check('rejects a wrong legacy secret', $res instanceof WP_Error);
 check('first delivery of an event is claimed', invoke($handler, 'claim_event', array('9001')) === true);
 check('retry of the same event is rejected as duplicate', invoke($handler, 'claim_event', array('9001')) === false);
 check('a different event still processes', invoke($handler, 'claim_event', array('9002')) === true);
+
+// ==================================================== 11. Tolerant response shapes
+section('11. Real-world response shapes (the live API disagreed with the spec)');
+
+// Envelope: {"data": {...}}
+reset_state();
+$GLOBALS['api'] = function ($method, $url) {
+    if ($method === 'GET') { return json_reply(200, array('webhooks' => array())); }
+    return json_reply(200, array('data' => array('webhook_id' => 55, 'signing_secret' => 'whsec_env')));
+};
+$r = SP_Webhook_Provisioner::sync();
+check('create response nested under "data"', ($r['state'] ?? '') === 'ok', json_encode($r));
+check('  -> id read from envelope', SP_Webhook_Provisioner::webhook_id() === 55);
+check('  -> secret read from envelope', SP_Webhook_Provisioner::signing_secret() === 'whsec_env');
+
+// Alternate key names: id / secret
+reset_state();
+$GLOBALS['api'] = function ($method, $url) {
+    if ($method === 'GET') { return json_reply(200, array()); }
+    return json_reply(200, array('id' => 56, 'secret' => 'whsec_alt'));
+};
+$r = SP_Webhook_Provisioner::sync();
+check('create response using "id"/"secret" key names', ($r['state'] ?? '') === 'ok', json_encode($r));
+check('  -> id 56', SP_Webhook_Provisioner::webhook_id() === 56);
+check('  -> secret recovered', SP_Webhook_Provisioner::signing_secret() === 'whsec_alt');
+
+// Created, but the secret arrives only via rotate.
+reset_state();
+$GLOBALS['api'] = function ($method, $url) {
+    if ($method === 'GET') { return json_reply(200, array('webhooks' => array())); }
+    if (str_ends_with($url, '/rotate-secret')) { return json_reply(200, array('signing_secret' => 'whsec_late')); }
+    return json_reply(200, array('webhook_id' => 57, 'status' => 'active')); // no secret inline
+};
+$r = SP_Webhook_Provisioner::sync();
+check('create without an inline secret recovers via rotate', ($r['state'] ?? '') === 'ok', json_encode($r));
+check('  -> keeps the created id (no orphan)', SP_Webhook_Provisioner::webhook_id() === 57);
+check('  -> obtained a usable secret', SP_Webhook_Provisioner::signing_secret() === 'whsec_late');
+
+// THE DUPLICATE GUARD: unreadable list must never lead to a create.
+reset_state();
+$GLOBALS['api'] = function ($method, $url) {
+    if ($method === 'GET') { return json_reply(200, array('unexpected' => 'shape')); }
+    return json_reply(200, array('webhook_id' => 999, 'signing_secret' => 'nope'));
+};
+$r = SP_Webhook_Provisioner::sync();
+$methods = array_column($GLOBALS['http_log'], 'method');
+check('unreadable webhook list -> refuses to create', ($r['state'] ?? '') === 'error', json_encode($r));
+check('  -> made NO POST (this is what prevents duplicates)',
+    !in_array('POST', $methods, true), implode(',', $methods));
+check('  -> error names the offending shape', strpos($r['message'], 'unexpected') !== false, $r['message']);
+
+// Explicit null list means "none", so creating is correct.
+reset_state();
+$GLOBALS['api'] = function ($method, $url) {
+    if ($method === 'GET') { return json_reply(200, array('webhooks' => null)); }
+    return json_reply(200, array('webhook_id' => 58, 'signing_secret' => 'whsec_null'));
+};
+$r = SP_Webhook_Provisioner::sync();
+check('"webhooks": null is treated as empty, so it creates', ($r['state'] ?? '') === 'ok', json_encode($r));
+
+// A single webhook object returned instead of a list.
+reset_state();
+$GLOBALS['api'] = function ($method, $url) {
+    if ($method === 'GET') {
+        return json_reply(200, array('webhook_id' => 9, 'url' => 'https://shop.example.com/wp-json/woowh/v1/webhook', 'status' => 'active'));
+    }
+    if (str_ends_with($url, '/rotate-secret')) { return json_reply(200, array('signing_secret' => 'whsec_single')); }
+    return json_reply(500, array('message' => 'MUST NOT CREATE'));
+};
+$r = SP_Webhook_Provisioner::sync();
+$methods = array_column($GLOBALS['http_log'], 'method');
+check('a lone webhook object is understood as a list of one', ($r['state'] ?? '') === 'ok', json_encode($r));
+check('  -> adopted it rather than creating', SP_Webhook_Provisioner::webhook_id() === 9);
+
+// Shape logging must not leak the secret.
+$describe = new ReflectionMethod('SP_Webhook_Provisioner', 'describe_shape');
+$describe->setAccessible(true);
+$shape = $describe->invokeArgs(null, array(array(
+    'webhook_id' => 42, 'signing_secret' => 'SUPERSECRETVALUE',
+    'status' => 'active', 'nested' => array('secret' => 'ALSOSECRET'),
+), 0));
+check('shape logging shows structure', strpos($shape, 'webhook_id:int(42)') !== false, $shape);
+check('shape logging does NOT leak the signing secret',
+    strpos($shape, 'SUPERSECRETVALUE') === false && strpos($shape, 'ALSOSECRET') === false, $shape);
+check('shape logging keeps diagnostic fields readable', strpos($shape, '"active"') !== false, $shape);
+
+// ========================================= 12. Create succeeded but we couldn't tell
+section('12. Create landed server-side but the reply was unusable');
+
+// Exactly the reported production case: POST returns 2xx with a body carrying no
+// id we recognise, yet the webhook really was created.
+reset_state();
+$created = false;
+$GLOBALS['api'] = function ($method, $url) use (&$created) {
+    if ($method === 'GET') {
+        return $created
+            ? json_reply(200, array('webhooks' => array(array(
+                'webhook_id' => 321,
+                'url' => 'https://shop.example.com/wp-json/woowh/v1/webhook',
+                'status' => 'active',
+              ))))
+            : json_reply(200, array('webhooks' => array()));
+    }
+    if (str_ends_with($url, '/rotate-secret')) {
+        return json_reply(200, array('signing_secret' => 'whsec_recovered'));
+    }
+    // Create works, but answers with a shape we cannot read.
+    $created = true;
+    return json_reply(201, array('message' => 'Webhook created'));
+};
+$r = SP_Webhook_Provisioner::sync();
+check('recovers instead of reporting a false failure', ($r['state'] ?? '') === 'ok', json_encode($r));
+check('  -> adopted the webhook that was actually created', SP_Webhook_Provisioner::webhook_id() === 321);
+check('  -> obtained a signing secret for it', SP_Webhook_Provisioner::signing_secret() === 'whsec_recovered');
+$methods = array_column($GLOBALS['http_log'], 'method');
+check('  -> created exactly once', count(array_keys($methods, 'POST')) >= 1
+    && count(array_filter($GLOBALS['http_log'], function ($c) {
+        return $c['method'] === 'POST' && !str_ends_with($c['url'], '/rotate-secret');
+    })) === 1, implode(',', $methods));
+
+// Transport blew up (timeout / 502) but the create had already landed.
+reset_state();
+$landed = false;
+$GLOBALS['api'] = function ($method, $url) use (&$landed) {
+    if ($method === 'GET') {
+        return $landed
+            ? json_reply(200, array('webhooks' => array(array(
+                'webhook_id' => 654,
+                'url' => 'https://shop.example.com/wp-json/woowh/v1/webhook',
+                'status' => 'active',
+              ))))
+            : json_reply(200, array('webhooks' => array()));
+    }
+    if (str_ends_with($url, '/rotate-secret')) {
+        return json_reply(200, array('signing_secret' => 'whsec_after_timeout'));
+    }
+    $landed = true;
+    return json_reply(504, array('message' => 'gateway timeout'));
+};
+$r = SP_Webhook_Provisioner::sync();
+check('a 5xx on create still recovers if the webhook exists', ($r['state'] ?? '') === 'ok', json_encode($r));
+check('  -> adopted id 654', SP_Webhook_Provisioner::webhook_id() === 654);
+
+// Genuine failure: create errored AND nothing exists. Must still report an error.
+reset_state();
+$GLOBALS['api'] = function ($method, $url) {
+    if ($method === 'GET') { return json_reply(200, array('webhooks' => array())); }
+    return json_reply(500, array('message' => 'database is down'));
+};
+$r = SP_Webhook_Provisioner::sync();
+check('a real failure is still reported as an error', ($r['state'] ?? '') === 'error', json_encode($r));
+check('  -> and still says contact support', stripos($r['message'], 'support') !== false, $r['message']);
+
+// Unreadable create AND the follow-up shows nothing -> honest failure.
+reset_state();
+$GLOBALS['api'] = function ($method, $url) {
+    if ($method === 'GET') { return json_reply(200, array('webhooks' => array())); }
+    return json_reply(200, array('message' => 'ok but useless'));
+};
+$r = SP_Webhook_Provisioner::sync();
+check('unreadable create with nothing to adopt -> error, not a false success',
+    ($r['state'] ?? '') === 'error', json_encode($r));
+
+// ================================================= 13. Legacy namespace migration
+section('13. Migrating merchants off the retired callback namespace');
+
+check('canonical namespace is generic (no product or company name)',
+    SP_Webhook_Provisioner::NAMESPACE_CURRENT === 'woowh/v1',
+    SP_Webhook_Provisioner::NAMESPACE_CURRENT);
+check('the old namespace is still served for compatibility',
+    in_array('stablecoin/v1', SP_Webhook_Provisioner::NAMESPACES_LEGACY, true));
+check('handler registers canonical first, then legacy',
+    SP_Webhook_Provisioner::all_namespaces() === array('woowh/v1', 'stablecoin/v1'),
+    implode(',', SP_Webhook_Provisioner::all_namespaces()));
+
+// A merchant registered before the rename: their webhook points at the old path.
+// It must be REPOINTED, not duplicated.
+reset_state();
+$GLOBALS['api'] = function ($method, $url) {
+    if ($method === 'GET') {
+        return json_reply(200, array('webhooks' => array(array(
+            'webhook_id' => 700,
+            'url' => 'https://shop.example.com/wp-json/stablecoin/v1/webhook',
+            'status' => 'active',
+        ))));
+    }
+    if ($method === 'PUT') { return json_reply(200, array('message' => 'Webhook updated')); }
+    if (str_ends_with($url, '/rotate-secret')) { return json_reply(200, array('signing_secret' => 'whsec_migrated')); }
+    return json_reply(500, array('message' => 'MUST NOT CREATE A SECOND WEBHOOK'));
+};
+$r = SP_Webhook_Provisioner::sync();
+$methods = array_column($GLOBALS['http_log'], 'method');
+$creates = array_filter($GLOBALS['http_log'], function ($c) {
+    return $c['method'] === 'POST' && !str_ends_with($c['url'], '/rotate-secret');
+});
+check('legacy-path webhook is migrated', ($r['state'] ?? '') === 'ok', json_encode($r));
+check('  -> used PUT to repoint it', in_array('PUT', $methods, true), implode(',', $methods));
+check('  -> did NOT create a duplicate', count($creates) === 0, implode(',', $methods));
+check('  -> kept the same webhook id', SP_Webhook_Provisioner::webhook_id() === 700);
+$put = null;
+foreach ($GLOBALS['http_log'] as $call) { if ($call['method'] === 'PUT') { $put = $call; } }
+// Decode rather than substring-match: json_encode escapes forward slashes.
+$put_url = $put ? (json_decode($put['body'], true)['url'] ?? '') : '';
+check('  -> PUT targets the new woowh path',
+    $put_url === 'https://shop.example.com/wp-json/woowh/v1/webhook', $put_url);
+check('  -> no longer points at the old path', $put && strpos($put['body'], 'stablecoin') === false,
+    $put ? $put['body'] : 'no PUT');
+
+// Already migrated: an exact match on the canonical URL wins, nothing is changed.
+reset_state();
+$GLOBALS['options']['sp_webhook_signing_secret'] = 'whsec_existing';
+$GLOBALS['api'] = function ($method, $url) {
+    if ($method === 'GET') {
+        return json_reply(200, array('webhooks' => array(array(
+            'webhook_id' => 701,
+            'url' => 'https://shop.example.com/wp-json/woowh/v1/webhook',
+            'status' => 'active',
+        ))));
+    }
+    return json_reply(500, array('message' => 'MUST NOT MODIFY ANYTHING'));
+};
+$r = SP_Webhook_Provisioner::sync();
+$methods = array_column($GLOBALS['http_log'], 'method');
+check('an already-migrated webhook is left alone', ($r['state'] ?? '') === 'ok', json_encode($r));
+check('  -> no PUT, no POST', $methods === array('GET'), implode(',', $methods));
+
+// Both an old and a new webhook exist: prefer the canonical one, do not touch the old.
+reset_state();
+$GLOBALS['options']['sp_webhook_signing_secret'] = 'whsec_existing';
+$GLOBALS['api'] = function ($method, $url) {
+    if ($method === 'GET') {
+        return json_reply(200, array('webhooks' => array(
+            array('webhook_id' => 800, 'url' => 'https://shop.example.com/wp-json/stablecoin/v1/webhook', 'status' => 'active'),
+            array('webhook_id' => 801, 'url' => 'https://shop.example.com/wp-json/woowh/v1/webhook', 'status' => 'active'),
+        )));
+    }
+    return json_reply(500, array('message' => 'MUST NOT MODIFY ANYTHING'));
+};
+$r = SP_Webhook_Provisioner::sync();
+check('with both present, the canonical one is adopted', SP_Webhook_Provisioner::webhook_id() === 801,
+    (string) SP_Webhook_Provisioner::webhook_id());
+check('  -> and nothing is created or repointed',
+    array_column($GLOBALS['http_log'], 'method') === array('GET'));
+
+// Deliveries to the legacy path must still verify - the route stays alive.
+reset_state();
+$GLOBALS['options']['sp_webhook_signing_secret'] = 'whsec_legacy_path';
+$handler = new SP_Webhook_Handler();
+$lbody = '{"type":"payment","origin_id":"legacy-1"}';
+$lts   = (string) time();
+$lsig  = base64_encode(hash_hmac('sha256', $lts . '.' . $lbody, 'whsec_legacy_path', true));
+$res = invoke($handler, 'verify_delivery', array(new FakeRequest(array(
+    'X-Webhook-Signature' => $lsig, 'X-Webhook-Timestamp' => $lts,
+), $lbody), $lbody));
+check('a delivery arriving on the legacy route still verifies', $res === true);
+
+// ============================================ 14. Stale notices must not linger
+section('14. A stored failure is re-validated, not shown forever');
+
+// The exact reported case: an error written by an OLDER build (no schema stamp),
+// still sitting in the options table after a later save succeeded.
+reset_state();
+$GLOBALS['options']['sp_webhook_provision_status'] = array(
+    'state'   => 'error',
+    'message' => 'The API did not return a webhook id. Contact support.',
+    'time'    => time() - 3600,
+);
+$GLOBALS['options']['sp_webhook_id'] = 321;
+$GLOBALS['options']['sp_webhook_signing_secret'] = 'whsec_live';
+
+$s = SP_Webhook_Provisioner::status();
+check('an old-build error is not shown once a webhook is registered',
+    ($s['state'] ?? '') === 'ok', json_encode($s));
+check('  -> the stale wording is gone',
+    strpos(json_encode($s), 'did not return a webhook id') === false, json_encode($s));
+check('  -> replaced status is stamped with the current schema',
+    ($s['schema'] ?? 0) === SP_Webhook_Provisioner::STATUS_SCHEMA);
+check('  -> and persisted, so it does not re-derive every load',
+    ($GLOBALS['options']['sp_webhook_provision_status']['state'] ?? '') === 'ok');
+
+// Old-build error, and nothing is actually registered -> stay silent rather than
+// showing wording from a previous version.
+reset_state();
+$GLOBALS['options']['sp_webhook_provision_status'] = array(
+    'state' => 'error', 'message' => 'Some ancient message.', 'time' => time() - 3600,
+);
+$s = SP_Webhook_Provisioner::status();
+check('old-build error with nothing registered -> no notice at all', $s === array(), json_encode($s));
+check('  -> and the stale option is cleared',
+    !isset($GLOBALS['options']['sp_webhook_provision_status']));
+
+// A CURRENT-build failure with nothing registered must still be reported.
+reset_state();
+$GLOBALS['api'] = function ($method, $url) {
+    if ($method === 'GET') { return json_reply(200, array('webhooks' => array())); }
+    return json_reply(500, array('message' => 'database is down'));
+};
+SP_Webhook_Provisioner::sync();
+$s = SP_Webhook_Provisioner::status();
+check('a genuine current failure is still surfaced', ($s['state'] ?? '') === 'error', json_encode($s));
+check('  -> and survives repeated reads', (SP_Webhook_Provisioner::status()['state'] ?? '') === 'error');
+
+// A failure recorded while a webhook IS registered is treated as stale.
+reset_state();
+$GLOBALS['options']['sp_webhook_id'] = 55;
+$GLOBALS['options']['sp_webhook_signing_secret'] = 'whsec_ok';
+$GLOBALS['options']['sp_webhook_provision_status'] = array(
+    'state' => 'error', 'message' => 'Transient blip.', 'time' => time() - 10,
+    'schema' => SP_Webhook_Provisioner::STATUS_SCHEMA,
+);
+$s = SP_Webhook_Provisioner::status();
+check('a failure contradicted by a live registration is discarded',
+    ($s['state'] ?? '') === 'ok', json_encode($s));
+
+// is_registered needs BOTH id and secret - an id alone cannot verify deliveries.
+reset_state();
+$GLOBALS['options']['sp_webhook_id'] = 12;
+check('id without a signing secret is not "registered"', SP_Webhook_Provisioner::is_registered() === false);
+$GLOBALS['options']['sp_webhook_signing_secret'] = 'whsec_x';
+check('id plus secret is registered', SP_Webhook_Provisioner::is_registered() === true);
+
+// Dismissal hides the current message but not a later, different one.
+reset_state();
+$GLOBALS['api'] = function ($method, $url) {
+    if ($method === 'GET') { return json_reply(200, array('webhooks' => array())); }
+    return json_reply(500, array('message' => 'still broken'));
+};
+SP_Webhook_Provisioner::sync();
+SP_Webhook_Provisioner::dismiss_status();
+check('dismissing flags the stored status', !empty(SP_Webhook_Provisioner::status()['dismissed']));
+SP_Webhook_Provisioner::sync(); // fails again -> fresh record
+check('a subsequent failure clears the dismissal and shows again',
+    empty(SP_Webhook_Provisioner::status()['dismissed']));
 
 // ===================================================================== summary
 echo "\n" . str_repeat('=', 62) . "\n";
