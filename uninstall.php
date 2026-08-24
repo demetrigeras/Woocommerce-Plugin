@@ -40,6 +40,7 @@ function sp_uninstall_plugin() {
     delete_option('sp_webhook_id');
     delete_option('sp_webhook_signing_secret');
     delete_option('sp_webhook_registered_url');
+    delete_option('sp_webhook_merchant_id');
     delete_option('sp_webhook_provision_status');
 
     // Options left behind by builds that used the legacy key prefix. The

@@ -736,6 +736,113 @@ check('a real, unresolved failure is still shown', ($s['state'] ?? '') === 'erro
 check('  -> and is stamped with the current schema',
     ($s['schema'] ?? 0) === SP_Webhook_Provisioner::STATUS_SCHEMA);
 
+// ============================================== 16. Never register the same site twice
+section('16. Duplicate prevention across credential changes and odd list shapes');
+
+function creates_in_log() {
+    return array_values(array_filter($GLOBALS['http_log'], function ($c) {
+        return $c['method'] === 'POST' && !str_ends_with($c['url'], '/rotate-secret')
+            && !str_ends_with($c['url'], '/disable');
+    }));
+}
+
+// THE REPORTED BUG: changing the API key and saving again must not create a twin.
+reset_state();
+$store = array();
+$GLOBALS['api'] = function ($method, $url) use (&$store) {
+    if ($method === 'GET') { return json_reply(200, array('webhooks' => array_values($store))); }
+    if (str_ends_with($url, '/rotate-secret')) { return json_reply(200, array('signing_secret' => 'whsec_r')); }
+    if ($method === 'PUT') { return json_reply(200, array('message' => 'updated')); }
+    $store[] = array('webhook_id' => 500 + count($store),
+        'url' => 'https://shop.example.com/wp-json/woowh/v1/webhook', 'status' => 'active');
+    return json_reply(200, array('webhook_id' => 500, 'signing_secret' => 'whsec_first'));
+};
+SP_Webhook_Provisioner::sync();                                   // initial registration
+$GLOBALS['options']['woocommerce_sp_settings']['api_key'] = 'sk_rotated_key';  // merchant rotates their key
+$GLOBALS['http_log'] = array();
+$r = SP_Webhook_Provisioner::sync();                              // save again
+check('changing only the API key does not create a second webhook',
+    count(creates_in_log()) === 0, json_encode(array_column($GLOBALS['http_log'], 'method')));
+check('  -> and the save still succeeds', ($r['state'] ?? '') === 'ok', json_encode($r));
+
+// A list that names the URL field something other than "url" must still match.
+foreach (array('endpoint', 'callback_url', 'target_url', 'webhookUrl') as $url_key) {
+    reset_state();
+    $GLOBALS['api'] = function ($method, $url) use ($url_key) {
+        if ($method === 'GET') {
+            return json_reply(200, array('webhooks' => array(array(
+                'webhook_id' => 610,
+                $url_key => 'https://shop.example.com/wp-json/woowh/v1/webhook',
+                'status' => 'active',
+            ))));
+        }
+        if (str_ends_with($url, '/rotate-secret')) { return json_reply(200, array('signing_secret' => 'whsec_k')); }
+        return json_reply(200, array('webhook_id' => 999, 'signing_secret' => 'DUPLICATE'));
+    };
+    SP_Webhook_Provisioner::sync();
+    check("list using \"$url_key\" instead of \"url\" is still matched",
+        count(creates_in_log()) === 0 && SP_Webhook_Provisioner::webhook_id() === 610,
+        'id=' . SP_Webhook_Provisioner::webhook_id());
+}
+
+// We own a webhook the listing does not show: update it rather than create.
+reset_state();
+$GLOBALS['options']['sp_webhook_id'] = 720;
+$GLOBALS['options']['sp_webhook_signing_secret'] = 'whsec_have';
+$GLOBALS['options']['sp_webhook_merchant_id'] = '3f8b21c4-9d0e-4a71-b2c5-6e7d8f9a0b1c';
+$GLOBALS['api'] = function ($method, $url) {
+    if ($method === 'GET') { return json_reply(200, array('webhooks' => array())); }
+    if ($method === 'PUT') { return json_reply(200, array('message' => 'updated')); }
+    return json_reply(200, array('webhook_id' => 999, 'signing_secret' => 'DUPLICATE'));
+};
+$r = SP_Webhook_Provisioner::sync();
+check('a stored webhook missing from the listing is updated, not duplicated',
+    count(creates_in_log()) === 0 && ($r['state'] ?? '') === 'ok', json_encode($r));
+check('  -> keeps the id we already had', SP_Webhook_Provisioner::webhook_id() === 720);
+
+// ...unless it is genuinely gone, in which case creating is correct.
+reset_state();
+$GLOBALS['options']['sp_webhook_id'] = 721;
+$GLOBALS['options']['sp_webhook_signing_secret'] = 'whsec_stale';
+$GLOBALS['options']['sp_webhook_merchant_id'] = '3f8b21c4-9d0e-4a71-b2c5-6e7d8f9a0b1c';
+$GLOBALS['api'] = function ($method, $url) {
+    if ($method === 'GET') { return json_reply(200, array('webhooks' => array())); }
+    if ($method === 'PUT') { return json_reply(404, array('message' => 'webhook not found')); }
+    return json_reply(200, array('webhook_id' => 722, 'signing_secret' => 'whsec_new'));
+};
+$r = SP_Webhook_Provisioner::sync();
+check('a deleted stored webhook falls through to create', ($r['state'] ?? '') === 'ok', json_encode($r));
+check('  -> with the new id', SP_Webhook_Provisioner::webhook_id() === 722);
+
+// Switching to a DIFFERENT merchant must not touch the old account's webhook.
+reset_state();
+$GLOBALS['options']['sp_webhook_id'] = 800;
+$GLOBALS['options']['sp_webhook_signing_secret'] = 'whsec_old_account';
+$GLOBALS['options']['sp_webhook_merchant_id'] = '11111111-1111-1111-1111-111111111111';
+$GLOBALS['api'] = function ($method, $url) {
+    if ($method === 'GET') { return json_reply(200, array('webhooks' => array())); }
+    if ($method === 'PUT') { return json_reply(200, array('message' => 'MUST NOT PUT ACROSS ACCOUNTS')); }
+    return json_reply(200, array('webhook_id' => 801, 'signing_secret' => 'whsec_new_account'));
+};
+$r = SP_Webhook_Provisioner::sync();
+$methods = array_column($GLOBALS['http_log'], 'method');
+check('a merchant change discards the old registration', ($r['state'] ?? '') === 'ok', json_encode($r));
+check('  -> no PUT into the previous account', !in_array('PUT', $methods, true), implode(',', $methods));
+check('  -> a fresh webhook is created under the new account',
+    SP_Webhook_Provisioner::webhook_id() === 801);
+check('  -> and the new owner is recorded',
+    ($GLOBALS['options']['sp_webhook_merchant_id'] ?? '') === '3f8b21c4-9d0e-4a71-b2c5-6e7d8f9a0b1c');
+
+// Same merchant, id collision safety: stored id is only reused for the same account.
+reset_state();
+$GLOBALS['api'] = function ($method, $url) {
+    if ($method === 'GET') { return json_reply(200, array('webhooks' => array())); }
+    return json_reply(200, array('webhook_id' => 900, 'signing_secret' => 'whsec_owner'));
+};
+SP_Webhook_Provisioner::sync();
+check('the owning merchant is recorded on a normal create',
+    ($GLOBALS['options']['sp_webhook_merchant_id'] ?? '') === '3f8b21c4-9d0e-4a71-b2c5-6e7d8f9a0b1c');
+
 // ===================================================================== summary
 echo "\n" . str_repeat('=', 62) . "\n";
 printf("  %d passed, %d failed\n", $pass, $fail);

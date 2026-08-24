@@ -30,6 +30,13 @@ class SP_Webhook_Provisioner {
     /** Callback URL we last successfully registered, so we can detect site moves. */
     const OPTION_REGISTERED_URL = 'sp_webhook_registered_url';
 
+    /**
+     * Merchant account the stored registration belongs to. Credentials can be
+     * repointed at a different account; without this we would keep acting on a
+     * webhook we no longer own.
+     */
+    const OPTION_MERCHANT_ID = 'sp_webhook_merchant_id';
+
     /** Last provisioning outcome, surfaced as an admin notice. */
     const OPTION_STATUS = 'sp_webhook_provision_status';
 
@@ -169,6 +176,10 @@ class SP_Webhook_Provisioner {
             return self::fail('unreachable', $unreachable);
         }
 
+        // 0. If these credentials point at a different merchant than the stored
+        //    registration, that registration is no longer ours to touch.
+        self::forget_if_merchant_changed($credentials);
+
         // 1. What already exists for this merchant?
         $existing = self::find_existing($callback_url, $credentials);
 
@@ -191,7 +202,14 @@ class SP_Webhook_Provisioner {
             return self::update_url($existing['legacy'], $callback_url, $credentials);
         }
 
-        // 5. Nothing to reuse - create.
+        // 5. Nothing in the listing matched, but we may still own a webhook the
+        //    listing did not show. Reuse beats creating a duplicate.
+        $reused = self::try_stored_webhook($callback_url, $credentials);
+        if ($reused) {
+            return $reused;
+        }
+
+        // 6. Genuinely nothing to reuse - create.
         return self::create($callback_url, $credentials);
     }
 
@@ -222,7 +240,7 @@ class SP_Webhook_Provisioner {
                 continue;
             }
             $id  = self::extract_id($webhook);
-            $url = isset($webhook['url']) ? (string) $webhook['url'] : '';
+            $url = self::extract_url($webhook);
 
             if ($url !== '' && self::same_url($url, $callback_url)) {
                 $result['match'] = $webhook;
@@ -244,7 +262,76 @@ class SP_Webhook_Provisioner {
             }
         }
 
+        // Existing webhooks, none of which we could tie to this site. That is the
+        // shape of a duplicate about to be created, so record why: usually a field
+        // name we do not read yet. describe_shape() shows url/status values.
+        if (!$result['match'] && !$result['ours'] && !$result['legacy'] && !empty($webhooks)) {
+            error_log(sprintf(
+                'PP Webhook Provisioner: %d existing webhook(s) but none matched %s. First record: %s',
+                count($webhooks),
+                $callback_url,
+                self::describe_shape(reset($webhooks))
+            ));
+        }
+
         return $result;
+    }
+
+    /**
+     * Forget a registration that belongs to a different merchant account.
+     *
+     * Credentials can be repointed at another account. Anything stored then refers
+     * to a webhook we can no longer see or authenticate against, and worse, its id
+     * could coincide with an unrelated webhook under the new account - a PUT would
+     * then quietly rewrite a stranger's record.
+     */
+    private static function forget_if_merchant_changed($credentials) {
+        $stored = (string) get_option(self::OPTION_MERCHANT_ID, '');
+
+        if ($stored === '' || $stored === $credentials['merchant_id']) {
+            return;
+        }
+
+        error_log(
+            'PP Webhook Provisioner: merchant changed from ' . $stored . ' to ' . $credentials['merchant_id']
+            . ' - discarding the stored registration. The webhook under the previous account is still active '
+            . 'and should be disabled there.'
+        );
+
+        self::forget_registration();
+    }
+
+    private static function forget_registration() {
+        delete_option(self::OPTION_WEBHOOK_ID);
+        delete_option(self::OPTION_SIGNING_SECRET);
+        delete_option(self::OPTION_REGISTERED_URL);
+        delete_option(self::OPTION_MERCHANT_ID);
+    }
+
+    /**
+     * Last line of defence before creating.
+     *
+     * We hold an id for this merchant but the listing did not surface it. Creating
+     * now is what produces duplicates, so try to update the record we already own;
+     * only fall through to create if the API says it is really gone.
+     *
+     * @return array|null Status array when the existing webhook was reused.
+     */
+    private static function try_stored_webhook($callback_url, $credentials) {
+        $stored_id = self::webhook_id();
+        if (!$stored_id) {
+            return null;
+        }
+
+        error_log('PP Webhook Provisioner: webhook #' . $stored_id . ' not present in the listing - trying to update it before creating');
+
+        try {
+            return self::update_url(array('webhook_id' => $stored_id), $callback_url, $credentials);
+        } catch (Exception $e) {
+            error_log('PP Webhook Provisioner: stored webhook #' . $stored_id . ' is unusable (' . $e->getMessage() . ') - creating a new one');
+            self::forget_registration();
+            return null;
+        }
     }
 
     /**
@@ -263,6 +350,7 @@ class SP_Webhook_Provisioner {
 
         update_option(self::OPTION_WEBHOOK_ID, $webhook_id, false);
         update_option(self::OPTION_REGISTERED_URL, $callback_url, false);
+        update_option(self::OPTION_MERCHANT_ID, $credentials['merchant_id'], false);
 
         // Re-enable a previously disabled record so disconnect -> reconnect works.
         $status = isset($webhook['status']) ? (string) $webhook['status'] : '';
@@ -294,6 +382,7 @@ class SP_Webhook_Provisioner {
 
         update_option(self::OPTION_WEBHOOK_ID, $webhook_id, false);
         update_option(self::OPTION_REGISTERED_URL, $callback_url, false);
+        update_option(self::OPTION_MERCHANT_ID, $credentials['merchant_id'], false);
 
         // A URL change does not reissue the secret, so an install that has the id
         // but never captured a secret still needs one.
@@ -352,6 +441,7 @@ class SP_Webhook_Provisioner {
 
         update_option(self::OPTION_WEBHOOK_ID, $webhook_id, false);
         update_option(self::OPTION_REGISTERED_URL, $callback_url, false);
+        update_option(self::OPTION_MERCHANT_ID, $credentials['merchant_id'], false);
 
         // The create response is normally the only one that carries the secret. If
         // this API returns it separately, recover it rather than failing and
@@ -557,6 +647,26 @@ class SP_Webhook_Provisioner {
             }
         }
         return 0;
+    }
+
+    /**
+     * Pull a callback URL out of a webhook record.
+     *
+     * Tolerant of field naming for the same reason extract_id() is: if this returns
+     * an empty string the record cannot be matched against this site, and an
+     * unmatched record means a duplicate gets created on the next save.
+     */
+    private static function extract_url($webhook) {
+        $keys = array('url', 'endpoint', 'callback_url', 'callbackUrl', 'target_url', 'targetUrl', 'webhook_url', 'webhookUrl');
+
+        foreach (self::candidates($webhook) as $node) {
+            foreach ($keys as $key) {
+                if (!empty($node[$key]) && is_string($node[$key])) {
+                    return $node[$key];
+                }
+            }
+        }
+        return '';
     }
 
     private static function extract_secret($response) {
