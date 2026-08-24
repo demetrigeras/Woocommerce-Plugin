@@ -1858,20 +1858,17 @@ class WC_Gateway_SP extends WC_Payment_Gateway {
     }
 
     public function get_webhook_destination_description() {
-        // The plugin registers this URL itself when settings are saved, so there is
-        // nothing for the merchant to copy. Say so, and stay quiet unless something
-        // is actually wrong - a working webhook needs no confirmation banner.
-        $intro = __('Registered automatically when you save these settings &mdash; no dashboard setup needed. This URL receives payment confirmations and moves orders to "Processing" when payment completes.', 'stablecoin-pay');
-
+        // The plugin registers this URL itself, so there is nothing to explain and
+        // nothing to copy. Show nothing at all unless something is actually wrong.
         $status = class_exists('SP_Webhook_Provisioner') ? SP_Webhook_Provisioner::status() : array();
 
         if (!empty($status['message'])) {
             $colour = (isset($status['state']) && $status['state'] === 'unreachable') ? '#b26200' : '#b32d2e';
-            return $intro . '<br><strong style="color:' . esc_attr($colour) . ';">'
+            return '<strong style="color:' . esc_attr($colour) . ';">'
                  . esc_html($status['message']) . '</strong>';
         }
 
-        return $intro;
+        return '';
     }
 
     /**
@@ -1920,6 +1917,12 @@ class WC_Gateway_SP extends WC_Payment_Gateway {
         ob_start();
         ?>
         <h3 style="margin-top:0;font-size:1.3em"><?php echo esc_html(__('Setup Instructions', 'stablecoin-pay')); ?></h3>
+        <?php /* SETUP VIDEO - TEMPORARILY DISABLED, DO NOT DELETE.
+                 Kept intact so it can be switched back on by removing this comment
+                 wrapper (the opening line above and the closing one below). It is
+                 still wired to `setup_video_url` in sp-whitelabel-config.php, so a
+                 partner build that sets that value will show the video again the
+                 moment this is uncommented. ?>
         <?php if ($setup_video_url) : ?>
         <div style="margin:0 0 20px;padding:15px;background:#f5f9ff;border:1px solid #3b82f6;border-radius:6px">
             <h4 style="margin:0 0 8px;color:#1d4ed8">🎥 <?php esc_html_e('Setup Video', 'stablecoin-pay'); ?></h4>
@@ -1941,6 +1944,7 @@ class WC_Gateway_SP extends WC_Payment_Gateway {
             </div>
         </div>
         <?php endif; ?>
+        <?php */ ?>
         <h4 style="margin:1.5em 0 .5em"><?php echo $step1_title; ?></h4>
         <ol style="line-height:1.6;margin-top:0">
             <li><?php echo $login_phrase; ?></li>
