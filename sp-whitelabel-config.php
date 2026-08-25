@@ -16,17 +16,17 @@ if (!defined('ABSPATH')) {
 
 return array(
     // Partner API environment (e.g. paymentservers.com, vantack.com). Null = Stablecoin Pay.
-    'environment_id' => 'syncharge.io',
+    'environment_id' => 'paymentservers.com',
 
     // Display name used everywhere (admin, gateway, Plugins list, checkout).
-    'plugin_name' => 'Syncharge',
+    'plugin_name' => 'Payment Servers',
 
     // Where merchants sign up and manage their account (setup instructions, field descriptions).
-    'dashboard_url' => 'https://app.syncharge.io',
+    'dashboard_url' => 'https://app.paymentservers.com',
 
     // Logo: prefer path under plugin (bundled in images/) so it loads same-origin. A direct https URL to app.*
     // often breaks on checkout because those responses send Cross-Origin-Resource-Policy: same-site (Chrome blocks).
-    'logo_url' => 'images/syncharge.square.dark.svg',
+    'logo_url' => 'images/paymentservers.square.dark.png',
 
     // Setup walkthrough shown in the gateway Setup Instructions box. Same sourcing rules as logo_url:
     // a path under the plugin (bundled in images/) loads same-origin and always works. A remote URL is
@@ -38,8 +38,8 @@ return array(
     // from environment_id (buy.{environment_id}), which resolves to the same thing. Set explicitly
     // so the redirect never depends on that naming convention holding, and so it stays correct even
     // if the API returns a different host. Point it at a test buy host to build against test.
-    'buy_base_url' => 'https://buy.syncharge.io',
+    'buy_base_url' => 'https://buy.paymentservers.com',
 
     // Zip filename produced by create-plugin-package.sh when this config is present.
-    'zip_name' => 'syncharge-plugin.zip',
+    'zip_name' => 'paymentservers-plugin.zip',
 );

@@ -367,15 +367,9 @@ class WC_Gateway_SP extends WC_Payment_Gateway {
                 'type' => 'sp_readonly_url',
                 'description' => $this->get_webhook_destination_description(),
             ),
-            'domain_whitelist' => array(
-                // Unlike the webhook URL, this one IS meant to be copied: the
-                // merchant submits it in their dashboard for review. Shown derived
-                // from the site so it cannot be mistyped.
-                'title' => __('Store Domain', 'stablecoin-pay'),
-                'type' => 'sp_readonly_url',
-                'value' => $this->get_store_domain(),
-                'description' => $this->get_domain_whitelist_description(),
-            ),
+            // No Store Domain row here on purpose: the domain and the instruction
+            // for submitting it already appear in Step 2 of the setup box above,
+            // and repeating them as a settings field just says the same thing twice.
             
         );
     }
@@ -2142,32 +2136,6 @@ class WC_Gateway_SP extends WC_Payment_Gateway {
     }
 
     /**
-     * Description shown under the Store Domain row.
-     */
-    public function get_domain_whitelist_description() {
-        $dashboard_url = $this->get_dashboard_url_from_config();
-
-        $where = $dashboard_url
-            ? sprintf(
-                /* translators: %s: linked dashboard hostname */
-                __('Submit this domain in your dashboard at %s under <strong>Settings &rarr; Domain Whitelist</strong>.', 'stablecoin-pay'),
-                '<a href="' . esc_url($dashboard_url) . '" target="_blank" rel="noopener">'
-                    . esc_html(wp_parse_url($dashboard_url, PHP_URL_HOST) ?: $dashboard_url) . '</a>'
-            )
-            : __('Submit this domain in your merchant dashboard under <strong>Settings &rarr; Domain Whitelist</strong>.', 'stablecoin-pay');
-
-        $why = __('Checkout is shown in an embedded window, and each store domain is reviewed before it is allowed to embed it. Until this domain is approved, customers cannot complete a payment.', 'stablecoin-pay');
-
-        if (!$this->store_domain_is_public()) {
-            return $where . ' ' . $why . '<br><strong style="color:#b26200;">'
-                 . esc_html__('This looks like a local or private address, which cannot be approved. Submit your live store domain once the site is public.', 'stablecoin-pay')
-                 . '</strong>';
-        }
-
-        return $where . ' ' . $why;
-    }
-
-    /**
      * The webhook URL is derived from the site, never stored.
      *
      * Older builds saved it with the shared secret appended as `?secret=...`, so a
@@ -2233,8 +2201,8 @@ class WC_Gateway_SP extends WC_Payment_Gateway {
         // Repeat the dashboard URL in every step that sends the merchant there, so
         // they don't have to scroll back up after switching tabs.
         // Step 1 (credentials) lives under Settings → API Keys.
-        // Step 3 (domain whitelist) lives under Settings → Domain Whitelist.
-        // Step 2 no longer sends them anywhere: the webhook registers itself.
+        // Step 2 (domain whitelist) lives under Settings → Domain Whitelist.
+        // The webhook is not a step: it registers itself on save.
         if ($dashboard_link) {
             $nav_dashboard_phrase = sprintf(
                 /* translators: %s: linked dashboard hostname (e.g. app.paymentservers.com) */
@@ -2245,10 +2213,10 @@ class WC_Gateway_SP extends WC_Payment_Gateway {
             $nav_dashboard_phrase = __('Navigate to <strong>Settings &rarr; API Keys</strong> in your dashboard', 'stablecoin-pay');
         }
 
-        $step4_title = $plugin_name ? sprintf(__('Step 4: Enable %s', 'stablecoin-pay'), esc_html($plugin_name)) : __('Step 4: Enable payment provider', 'stablecoin-pay');
+        $step3_title = $plugin_name ? sprintf(__('Step 3: Enable %s', 'stablecoin-pay'), esc_html($plugin_name)) : __('Step 3: Enable payment provider', 'stablecoin-pay');
         $important_phrase = $plugin_name
-            ? sprintf(__('<strong>⚠️ Important:</strong> %s works alongside other payment methods. Make sure to complete ALL steps above. The webhook is registered for you, but the domain whitelist in Step 3 is a manual approval and checkout will not load until it is granted.', 'stablecoin-pay'), esc_html($plugin_name))
-            : __('<strong>⚠️ Important:</strong> The payment provider works alongside other payment methods. Make sure to complete ALL steps above. The webhook is registered for you, but the domain whitelist in Step 3 is a manual approval and checkout will not load until it is granted.', 'stablecoin-pay');
+            ? sprintf(__('<strong>⚠️ Important:</strong> %s works alongside other payment methods. Make sure to complete ALL steps above. The webhook is registered for you, but the domain whitelist in Step 2 is a manual approval and checkout will not load until it is granted.', 'stablecoin-pay'), esc_html($plugin_name))
+            : __('<strong>⚠️ Important:</strong> The payment provider works alongside other payment methods. Make sure to complete ALL steps above. The webhook is registered for you, but the domain whitelist in Step 2 is a manual approval and checkout will not load until it is granted.', 'stablecoin-pay');
 
         $subscription_checkbox = $plugin_name
             ? sprintf(__('"%s Subscription"', 'stablecoin-pay'), esc_html($plugin_name))
@@ -2293,13 +2261,10 @@ class WC_Gateway_SP extends WC_Payment_Gateway {
             <li><?php echo __('After you open <strong>Settings &rarr; API Keys</strong>, click <strong>Add API</strong>, name your API key, select <strong>Full Access</strong> for permissions, click <strong>Review Key</strong>, and then copy and paste the generated API key into the <strong>API Key</strong> field in WooCommerce settings.', 'stablecoin-pay'); ?></li>
             <li><?php esc_html_e('Paste both into the fields below', 'stablecoin-pay'); ?></li>
         </ol>
-        <h4 style="margin:1.5em 0 .5em"><?php esc_html_e('Step 2: Webhook (automatic)', 'stablecoin-pay'); ?></h4>
-        <ol style="line-height:1.6;margin-top:0">
-            <li><?php echo __('Nothing to do &mdash; when you click <strong>Save changes</strong>, this plugin registers its own webhook with your account.', 'stablecoin-pay'); ?></li>
-            <li><?php echo __('The <strong>Webhook URL</strong> below is shown for reference only. You do not need to copy it anywhere.', 'stablecoin-pay'); ?></li>
-            <li><?php echo __('If registration fails you will see a notice here with a <strong>Retry webhook setup</strong> button. Payments keep working either way, but orders will not update until the webhook is registered.', 'stablecoin-pay'); ?></li>
-        </ol>
-        <h4 style="margin:1.5em 0 .5em"><?php esc_html_e('Step 3: Whitelist your store domain', 'stablecoin-pay'); ?></h4>
+        <?php // The webhook is registered automatically on save, so it is not a step
+              // the merchant performs and is deliberately absent from this list. A
+              // failure surfaces as an admin notice with a retry button instead. ?>
+        <h4 style="margin:1.5em 0 .5em"><?php esc_html_e('Step 2: Whitelist your store domain', 'stablecoin-pay'); ?></h4>
         <div style="margin:0 0 10px;padding:12px;background:#fef3c7;border:1px solid #998843;border-radius:4px">
             <p style="margin:0 0 8px"><strong><?php esc_html_e('Required before customers can pay.', 'stablecoin-pay'); ?></strong>
             <?php esc_html_e('Checkout opens in an embedded window, and each store domain is reviewed before it is allowed to embed it.', 'stablecoin-pay'); ?></p>
@@ -2313,8 +2278,13 @@ class WC_Gateway_SP extends WC_Payment_Gateway {
                 <li><?php esc_html_e('Paste the domain, submit it, and wait for approval.', 'stablecoin-pay'); ?></li>
                 <li><em><?php esc_html_e('Until it is approved the checkout window will not load, even though everything else is configured correctly.', 'stablecoin-pay'); ?></em></li>
             </ol>
+            <?php if (!$this->store_domain_is_public()) : ?>
+                <p style="margin:10px 0 0"><strong style="color:#b26200;"><?php
+                    esc_html_e('This looks like a local or private address, which cannot be approved. Submit your live store domain once the site is public.', 'stablecoin-pay');
+                ?></strong></p>
+            <?php endif; ?>
         </div>
-        <h4 style="margin:1.5em 0 .5em"><?php echo $step4_title; ?></h4>
+        <h4 style="margin:1.5em 0 .5em"><?php echo $step3_title; ?></h4>
         <ol style="line-height:1.6;margin-top:0">
             <li><?php echo sprintf(__('Check the <strong>%s</strong> box below', 'stablecoin-pay'), esc_html($this->get_enable_label())); ?></li>
             <li><?php echo __('Click <strong>Save changes</strong>', 'stablecoin-pay'); ?></li>
