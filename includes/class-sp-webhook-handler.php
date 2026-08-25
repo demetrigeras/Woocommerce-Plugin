@@ -11,6 +11,22 @@ if (!defined('ABSPATH')) {
 
 class SP_Webhook_Handler {
 
+    /**
+     * Event types that describe a wallet-to-wallet transfer (i.e. a refund payout).
+     *
+     * Embedded Wallet sends emit `embed_transfer` INSTEAD of `transfer` - the
+     * generic event is suppressed for them - so all variants must be treated alike
+     * or refunds paid out that way are never confirmed.
+     *
+     * @return string[]
+     */
+    public static function transfer_event_types() {
+        return array(
+            'transfer', 'embed_transfer', 'wallet_transfer',
+            'failed_transfer', 'failed_wallet_transfer',
+        );
+    }
+
     /** Seconds a delivery's timestamp may differ from ours before we reject it. */
     const SIGNATURE_TOLERANCE = 300;
 
@@ -135,10 +151,20 @@ class SP_Webhook_Handler {
         error_log('PP Webhook: Event type: ' . $event_type);
         error_log('PP Webhook: Origin ID: ' . $origin_id);
         error_log('PP Webhook: Merchant ID: ' . $merchant_id);
+
+        if (!$this->merchant_id_matches($merchant_id)) {
+            error_log('❌ PP Webhook: merchant_id "' . $merchant_id . '" is not this store\'s merchant - ignoring event');
+            return;
+        }
         
-        // For transfer/failed_transfer (refunds): find order by transfer_id or destination_email (no origin_id in payload)
-        if (in_array($event_type, array('transfer', 'failed_transfer'), true)) {
+        // Transfer events (refund payouts) carry no origin_id, so the order has to be
+        // found another way. transfer_id is the reliable key; the rest are fallbacks
+        // for refunds whose id we never managed to store.
+        if (in_array($event_type, self::transfer_event_types(), true)) {
             $transfer_id = $data['transfer_id'] ?? null;
+            $to_address = $data['to_address'] ?? null;
+            // Not part of the documented transfer payload - kept only as a last
+            // resort in case an older or embedded variant still sends it.
             $destination_email = $data['destination_email'] ?? null;
             if ($transfer_id) {
                 $orders_by_refund_id = wc_get_orders(array(
@@ -154,17 +180,31 @@ class SP_Webhook_Handler {
                     error_log('PP Webhook: Found order #' . $order->get_id() . ' by transfer_id (refund_id) for ' . $event_type);
                 }
             }
-            if (!$order && $destination_email) {
+            if (!$order && ($to_address || $destination_email)) {
                 $orders_pending_refund = wc_get_orders(array(
                     'meta_key' => '_sp_refund_pending',
                     'meta_value' => 'yes',
                     'meta_compare' => '=',
-                    'limit' => 5,
+                    'limit' => 20,
                     'orderby' => 'date',
                     'order' => 'DESC',
                 ));
+
                 foreach ($orders_pending_refund as $candidate) {
-                    if (strtolower(trim($candidate->get_billing_email())) === strtolower(trim($destination_email))) {
+                    // The documented payload identifies the recipient by wallet
+                    // address, so match that against the address recorded when the
+                    // customer paid.
+                    if ($to_address) {
+                        $candidate_wallet = (string) $candidate->get_meta('_customer_wallet_address');
+                        if ($candidate_wallet !== '' && strcasecmp(trim($candidate_wallet), trim($to_address)) === 0) {
+                            $order = $candidate;
+                            error_log('PP Webhook: Found order #' . $order->get_id() . ' by to_address for ' . $event_type);
+                            break;
+                        }
+                    }
+
+                    if ($destination_email
+                        && strtolower(trim($candidate->get_billing_email())) === strtolower(trim($destination_email))) {
                         $order = $candidate;
                         error_log('PP Webhook: Found order #' . $order->get_id() . ' by destination_email for ' . $event_type);
                         break;
@@ -369,10 +409,16 @@ class SP_Webhook_Handler {
                 break;
                 
             case 'transfer':
+            // Embedded Wallet sends emit embed_transfer INSTEAD of transfer - the
+            // generic event is deliberately suppressed - so without this case a
+            // refund paid out that way is never confirmed. Same payload shape.
+            case 'embed_transfer':
+            case 'wallet_transfer':
                 $this->handle_transfer_completed($order, $data);
                 break;
                 
             case 'failed_transfer':
+            case 'failed_wallet_transfer':
                 $this->handle_transfer_failed($order, $data);
                 break;
                 
@@ -684,10 +730,28 @@ class SP_Webhook_Handler {
         $to_address = $data['to_address'] ?? null;
         $destination_email = $data['destination_email'] ?? null;
         
-        // Only mark refund complete when status is explicitly success-like (fix: do not mark failed transfers complete)
+        // Documented transfer statuses are "success", "pending" and "failed", and
+        // only "success" means funds moved.
         $success_statuses = array('completed', 'confirmed', 'success', 'succeeded', 'complete');
+        $pending_statuses = array('pending', 'processing', 'queued', 'submitted', 'broadcast', 'in_progress');
+
         $is_success = in_array($status, $success_statuses, true);
+
         if (!$is_success) {
+            // "pending" is in flight, not a failure. A further delivery follows with
+            // the settled status, so recording a failure here would wrongly tell the
+            // merchant the refund bounced and hide the real outcome when it lands.
+            if (in_array($status, $pending_statuses, true)) {
+                error_log('⏳ PP Webhook: Transfer ' . ($transfer_id ?: '?') . ' is still pending ("' . $status . '") - leaving the refund open until it settles');
+
+                $order->update_meta_data('_sp_refund_status', 'pending');
+                if (!empty($transfer_id)) {
+                    $order->update_meta_data('_sp_refund_id', $transfer_id);
+                }
+                $order->save();
+                return;
+            }
+
             error_log('❌ PP Webhook: Transfer event status not success: "' . $status . '" – treating as failed');
             $this->handle_transfer_failed($order, $data);
             return;
@@ -926,6 +990,42 @@ class SP_Webhook_Handler {
 
         error_log('✅ PP Webhook - Signature verified');
         return true;
+    }
+
+    /**
+     * Whether a delivery's merchant_id belongs to this store.
+     *
+     * Deliberately lenient in two directions. The payload prefixes the id
+     * (`mrch_053daf5f-...`) while the gateway setting holds a bare UUID, so a
+     * strict comparison would reject every legitimate event; and an absent id or
+     * an unconfigured store cannot be judged, so those pass rather than dropping
+     * events the merchant is waiting on.
+     *
+     * @param string|null $incoming
+     * @return bool
+     */
+    private function merchant_id_matches($incoming) {
+        $incoming = is_string($incoming) ? trim($incoming) : '';
+        if ($incoming === '') {
+            return true; // Nothing to check against.
+        }
+
+        $settings = get_option('woocommerce_sp_settings', array());
+        $configured = isset($settings['merchant_id']) ? trim((string) $settings['merchant_id']) : '';
+        if ($configured === '') {
+            return true; // Store not configured yet.
+        }
+
+        $normalise = function ($id) {
+            $id = strtolower(trim((string) $id));
+            // Strip a leading type prefix such as "mrch_".
+            if (preg_match('/^[a-z]+_(.+)$/', $id, $m)) {
+                $id = $m[1];
+            }
+            return $id;
+        };
+
+        return $normalise($incoming) === $normalise($configured);
     }
 
     /**

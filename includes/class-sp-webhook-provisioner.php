@@ -108,6 +108,12 @@ class SP_Webhook_Provisioner {
             'cancellation',
             'transfer',
             'failed_transfer',
+            // Embedded Wallet sends emit embed_transfer INSTEAD of transfer, so
+            // without this a refund paid out that way is never confirmed and the
+            // order sits pending forever.
+            'embed_transfer',
+            'wallet_transfer',
+            'failed_wallet_transfer',
         ));
     }
 
@@ -377,8 +383,14 @@ class SP_Webhook_Provisioner {
             return self::create($callback_url, $credentials);
         }
 
-        // Partial update: omitted fields keep their current values.
-        self::request('PUT', 'webhooks/' . $webhook_id, array('url' => $callback_url), $credentials);
+        // Partial update: omitted fields keep their current values. The event list
+        // is sent too, so a webhook registered by an older build picks up event
+        // types added since - notably embed_transfer, without which refunds paid
+        // from an Embedded Wallet are never confirmed.
+        self::request('PUT', 'webhooks/' . $webhook_id, array(
+            'url'                    => $callback_url,
+            'subscribed_event_types' => self::event_types(),
+        ), $credentials);
 
         update_option(self::OPTION_WEBHOOK_ID, $webhook_id, false);
         update_option(self::OPTION_REGISTERED_URL, $callback_url, false);

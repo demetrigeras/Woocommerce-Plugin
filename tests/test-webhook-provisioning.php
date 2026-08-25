@@ -76,6 +76,7 @@ class SP_Whitelabel_Branding {
 
 require_once dirname(__DIR__) . '/includes/class-sp-webhook-provisioner.php';
 require_once dirname(__DIR__) . '/includes/class-sp-webhook-handler.php';
+require_once dirname(__DIR__) . '/includes/class-sp-api-client.php';
 
 // ------------------------------------------------------------------- assertions
 
@@ -844,6 +845,87 @@ check('the owning merchant is recorded on a normal create',
     ($GLOBALS['options']['sp_webhook_merchant_id'] ?? '') === '3f8b21c4-9d0e-4a71-b2c5-6e7d8f9a0b1c');
 
 // ===================================================================== summary
+
+// ================================= 9. Documented wallet-transfer payload handling
+section('9. Wallet Transfer webhook, per the published payload');
+
+// The exact example from the docs.
+$doc_transfer = array(
+    'type' => 'transfer',
+    'merchant_id' => 'mrch_053daf5f-7de6-491e-8096-5c8a8612f334',
+    'amount_in_usd' => '0.985000',
+    'hash' => '0x0924b6a3cc49d2ba216452358271533bc8190826b6cae395747be86b91a6ea98',
+    'transfer_id' => '7',
+    'wallet_id' => 'wa-tffvk-1nj19-1qqbt0j5ieophqg',
+    'network' => 'PolygonAmoy',
+    'from_address' => '0xd0cbe3ab3a241f6c4d5f2c0e2bfe37ec03fe7f04',
+    'to_address' => '0x1C337aBF69aB1DC1F9388e97bBd4AAD57059D8Eb',
+    'status' => 'success',
+    'status_confirmed_at' => '2025-08-15T11:43:19.641041+02:00',
+);
+
+$types = SP_Webhook_Handler::transfer_event_types();
+check('transfer is treated as a transfer event', in_array('transfer', $types, true));
+check('embed_transfer is too (it REPLACES transfer for embedded sends)',
+    in_array('embed_transfer', $types, true));
+check('wallet_transfer is too', in_array('wallet_transfer', $types, true));
+check('failed_transfer is too', in_array('failed_transfer', $types, true));
+check('failed_wallet_transfer is too', in_array('failed_wallet_transfer', $types, true));
+
+// merchant_id: payload prefixes it, our setting does not.
+$m = new ReflectionMethod('SP_Webhook_Handler', 'merchant_id_matches');
+$m->setAccessible(true);
+$h = new SP_Webhook_Handler();
+$GLOBALS['options']['woocommerce_sp_settings'] = array(
+    'merchant_id' => '053daf5f-7de6-491e-8096-5c8a8612f334', 'api_key' => 'k',
+);
+check('accepts the docs\' mrch_-prefixed id against a bare UUID setting',
+    $m->invoke($h, $doc_transfer['merchant_id']) === true);
+check('accepts an exact bare-UUID match',
+    $m->invoke($h, '053daf5f-7de6-491e-8096-5c8a8612f334') === true);
+check('is case-insensitive', $m->invoke($h, 'MRCH_053DAF5F-7DE6-491E-8096-5C8A8612F334') === true);
+check('rejects another merchant\'s event',
+    $m->invoke($h, 'mrch_99999999-0000-0000-0000-000000000000') === false);
+check('passes through when the payload omits merchant_id', $m->invoke($h, null) === true);
+$GLOBALS['options']['woocommerce_sp_settings'] = array('merchant_id' => '', 'api_key' => '');
+check('passes through when the store is unconfigured', $m->invoke($h, 'mrch_anything') === true);
+
+// Signature scheme, verified against the documented formula verbatim.
+$GLOBALS['options']['sp_webhook_signing_secret'] = 'whsec_doc';
+$raw = json_encode($doc_transfer);
+$ts = (string) time();
+$sig = base64_encode(hash_hmac('sha256', $ts . '.' . $raw, 'whsec_doc', true));
+$v = new ReflectionMethod('SP_Webhook_Handler', 'verify_delivery');
+$v->setAccessible(true);
+check('base64(HMAC_SHA256(secret, timestamp + "." + raw_body)) verifies',
+    $v->invokeArgs($h, array(new FakeRequest(array(
+        'X-Webhook-Signature' => $sig,
+        'X-Webhook-Timestamp' => $ts,
+        'X-Webhook-Signature-Version' => 'v1',
+    ), $raw), $raw)) === true);
+
+// transfer_id is a string like "7" and is what de-duplicates deliveries.
+check('a small numeric-string transfer_id is usable as an id',
+    SP_API_Client::extract_transfer_id($doc_transfer) === '7');
+check('the docs hash is read as the transaction hash',
+    SP_API_Client::extract_transaction_hash($doc_transfer) === $doc_transfer['hash']);
+
+// status: only "success" means funds moved; "pending" must NOT read as settled,
+// and must NOT be mistaken for a failure either.
+check('documented status "success" is not treated as awaiting signature',
+    !SP_API_Client::transfer_awaits_signature($doc_transfer));
+check('documented status "pending" IS treated as not-yet-settled',
+    SP_API_Client::transfer_awaits_signature(array('status' => 'pending')));
+
+// failed_transfer may carry an empty hash (failed before broadcast).
+$doc_failed = array_merge($doc_transfer, array(
+    'type' => 'failed_transfer', 'status' => 'failed', 'hash' => '',
+));
+check('an empty hash on a failed transfer yields no hash',
+    SP_API_Client::extract_transaction_hash($doc_failed) === '');
+check('a failed transfer is not read as awaiting signature',
+    !SP_API_Client::transfer_awaits_signature($doc_failed));
+
 echo "\n" . str_repeat('=', 62) . "\n";
 printf("  %d passed, %d failed\n", $pass, $fail);
 echo str_repeat('=', 62) . "\n";

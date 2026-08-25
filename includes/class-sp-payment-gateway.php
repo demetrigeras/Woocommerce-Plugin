@@ -367,6 +367,15 @@ class WC_Gateway_SP extends WC_Payment_Gateway {
                 'type' => 'sp_readonly_url',
                 'description' => $this->get_webhook_destination_description(),
             ),
+            'domain_whitelist' => array(
+                // Unlike the webhook URL, this one IS meant to be copied: the
+                // merchant submits it in their dashboard for review. Shown derived
+                // from the site so it cannot be mistyped.
+                'title' => __('Store Domain', 'stablecoin-pay'),
+                'type' => 'sp_readonly_url',
+                'value' => $this->get_store_domain(),
+                'description' => $this->get_domain_whitelist_description(),
+            ),
             
         );
     }
@@ -1347,6 +1356,145 @@ class WC_Gateway_SP extends WC_Payment_Gateway {
     /**
      * Process refunds (Automatic API refund for single payments)
      */
+    /**
+     * Merchant signing limit, in the payment currency.
+     *
+     * Transfers above this are created but not broadcast until the merchant signs
+     * them (or raises the limit) in their dashboard. The API answers 2xx either
+     * way, so this is the difference between a refund that moves funds and one
+     * that silently sits pending.
+     *
+     * @return float
+     */
+    public function get_refund_signing_limit() {
+        return (float) apply_filters('sp_refund_signing_limit', 100.0);
+    }
+
+    /**
+     * Extra balance needed on top of the refund amount to cover gas.
+     *
+     * @return float
+     */
+    public function get_refund_gas_headroom() {
+        return (float) apply_filters('sp_refund_gas_headroom', 0.1);
+    }
+
+    /**
+     * Merchant fee the transfer API charges to send the refund back out.
+     *
+     * Deducted from the same wallet balance as the refund and the gas, so it is
+     * part of what the merchant must hold. The amount is not yet finalised, so the
+     * default is 0 and the guidance says "plus the merchant fee" rather than
+     * quoting a total that would be wrong. Set it via the filter once known:
+     *
+     *     add_filter('sp_refund_merchant_fee', function ($fee, $amount) {
+     *         return round($amount * 0.01, 2);   // or a flat value
+     *     }, 10, 2);
+     *
+     * @param float $amount
+     * @return float
+     */
+    public function get_refund_merchant_fee($amount) {
+        return (float) apply_filters('sp_refund_merchant_fee', 0.0, (float) $amount);
+    }
+
+    /**
+     * Total the merchant wallet must hold for a refund of $amount to go through:
+     * the refund itself, the gas headroom, and the merchant fee.
+     *
+     * @param float $amount
+     * @return float
+     */
+    public function get_refund_required_balance($amount) {
+        return round(
+            (float) $amount + $this->get_refund_gas_headroom() + $this->get_refund_merchant_fee($amount),
+            6
+        );
+    }
+
+    /**
+     * How much the wallet needs, phrased honestly about the unknown fee.
+     *
+     * @param float  $amount
+     * @param string $token
+     * @return string
+     */
+    private function describe_required_balance($amount, $token) {
+        $required = $this->get_refund_required_balance($amount);
+        $fee      = $this->get_refund_merchant_fee($amount);
+
+        if ($fee > 0) {
+            return sprintf(
+                /* translators: 1: total, 2: token, 3: refund amount, 4: gas, 5: merchant fee */
+                __('%1$s %2$s (%3$s refund + %4$s gas + %5$s merchant fee)', 'stablecoin-pay'),
+                $required, $token, $amount, $this->get_refund_gas_headroom(), $fee
+            );
+        }
+
+        // Fee is charged but not quantified here, so do not imply a precise total.
+        return sprintf(
+            /* translators: 1: subtotal, 2: token, 3: refund amount, 4: gas */
+            __('more than %1$s %2$s (%3$s refund + %4$s gas), plus the merchant fee the transfer API charges to send it', 'stablecoin-pay'),
+            $required, $token, $amount, $this->get_refund_gas_headroom()
+        );
+    }
+
+    /**
+     * The one remedy available from here, for every failure path.
+     *
+     * Raising the signing limit in the merchant dashboard is currently the only
+     * way to unblock a refund from WooCommerce - there is no API to lift it, and
+     * no way to sign a parked transfer from this screen.
+     *
+     * NOTE: this whole refund flow is interim. Refunds are expected to move into
+     * the merchant dashboard, at which point this can be removed rather than
+     * extended.
+     *
+     * @return string
+     */
+    private function get_dashboard_limit_instruction() {
+        $dashboard_url = $this->get_dashboard_url_from_config();
+
+        $text = __('Go to your merchant dashboard and raise the signing limit on your wallet, then try the refund again. That is the only way to release a refund from here.', 'stablecoin-pay');
+
+        if ($dashboard_url) {
+            $host = wp_parse_url($dashboard_url, PHP_URL_HOST);
+            $text .= ' ' . sprintf(
+                /* translators: %s: linked dashboard hostname */
+                __('Your dashboard is at %s.', 'stablecoin-pay'),
+                '<a href="' . esc_url($dashboard_url) . '" target="_blank" rel="noopener">' . esc_html($host ?: $dashboard_url) . '</a>'
+            );
+        }
+
+        return $text;
+    }
+
+    /**
+     * Guidance shown when a refund cannot complete without merchant action.
+     *
+     * @param float  $amount
+     * @param string $headline
+     * @param string $action
+     * @return string
+     */
+    private function build_refund_action_note($amount, $headline, $action) {
+        $settings_url   = admin_url('admin.php?page=wc-settings&tab=checkout&section=sp');
+        $settings_label = $this->get_title();
+        $dashboard_url  = $this->get_dashboard_url_from_config();
+
+        $note  = '<strong>' . $headline . '</strong><br><br>';
+        $note .= $action . '<br><br>';
+
+        if ($dashboard_url) {
+            $note .= '<a href="' . esc_url($dashboard_url) . '" target="_blank" rel="noopener" class="button button-primary">'
+                   . esc_html__('Open merchant dashboard', 'stablecoin-pay') . '</a> ';
+        }
+        $note .= '<a href="' . esc_url($settings_url) . '" class="button">'
+               . sprintf(esc_html__('%s settings', 'stablecoin-pay'), esc_html($settings_label)) . '</a>';
+
+        return $note;
+    }
+
     public function process_refund($order_id, $amount = null, $reason = '') {
         error_log('PP Refund: process_refund called');
         error_log('PP Refund: Order ID: ' . $order_id);
@@ -1420,16 +1568,24 @@ class WC_Gateway_SP extends WC_Payment_Gateway {
         $chain_id = $order->get_meta('_sp_chain_id');
         $token_symbol = $order->get_meta('_sp_token_symbol');
         
-        // If chain ID is missing, fallback to Polygon Mainnet (Production)
+        // Refund on the network the customer actually paid on. Only when the order
+        // has no record of it do we fall back to the platform's current settlement
+        // network, and that default is filterable because settlement moves (it was
+        // USDC on Polygon, it is USDG on Ink) and hardcoding it here would silently
+        // send refunds to the wrong chain after the next change.
+        //
+        //     add_filter('sp_refund_fallback_chain_id', fn() => '57073');
+        //     add_filter('sp_refund_fallback_token', fn() => 'USDG');
         if (empty($chain_id)) {
-            $chain_id = '137'; // Polygon Mainnet (Production)
-            error_log('PP Refund: Chain ID not found in order, using fallback: Polygon Mainnet Production (137)');
+            $chain_id = (string) apply_filters('sp_refund_fallback_chain_id', '137');
+            error_log('PP Refund: Chain ID not recorded on the order, using fallback chain_id ' . $chain_id
+                . ' - set the sp_refund_fallback_chain_id filter if settlement has moved');
         }
-        
-        // If token symbol is missing, fallback to USDC (on the same chain)
+
         if (empty($token_symbol)) {
-            $token_symbol = 'USDC';
-            error_log('PP Refund: Token symbol not found in order, using fallback: USDC on chain_id ' . $chain_id);
+            $token_symbol = (string) apply_filters('sp_refund_fallback_token', 'USDC');
+            error_log('PP Refund: Token not recorded on the order, using fallback token ' . $token_symbol
+                . ' on chain_id ' . $chain_id . ' - set the sp_refund_fallback_token filter if settlement has moved');
         }
         
         error_log('PP Refund: Using refund chain/token: ' . $token_symbol . ' on chain_id ' . $chain_id);
@@ -1451,6 +1607,25 @@ class WC_Gateway_SP extends WC_Payment_Gateway {
         error_log('PP Refund: API client initialized (production)');
         error_log('PP Refund: API Base URL: ' . $api_base_url);
         
+        // Flag the two things that stop a transfer reaching the chain, before we
+        // ask for it, so the log explains the outcome either way.
+        $signing_limit = $this->get_refund_signing_limit();
+        if ((float) $amount > $signing_limit) {
+            error_log(sprintf(
+                'PP Refund: ⚠️ amount %s exceeds the %s signing limit - the transfer will be created but will need signing before it broadcasts',
+                $amount,
+                $signing_limit
+            ));
+        }
+        error_log(sprintf(
+            'PP Refund: merchant wallet needs %s %s (refund %s + %s gas + %s merchant fee)',
+            $this->get_refund_required_balance($amount),
+            $token_symbol,
+            $amount,
+            $this->get_refund_gas_headroom(),
+            $this->get_refund_merchant_fee($amount)
+        ));
+
         error_log('PP Refund: About to call refund API...');
         
         // Call refund API using customer email or wallet address
@@ -1482,8 +1657,15 @@ class WC_Gateway_SP extends WC_Payment_Gateway {
                 
                 $sp_settings_url = admin_url('admin.php?page=wc-settings&tab=checkout&section=sp');
                 
-                $insufficient_funds_note .= '<br><br><strong>🔧 Action Required - Add USDC to Polygon:</strong><br>';
-                $insufficient_funds_note .= 'You need ' . $amount . ' USDC on Polygon to process this refund.<br><br>';
+                // Gas AND the merchant fee come out of the same balance, so a wallet
+                // holding exactly the refund amount can never send it.
+                $insufficient_funds_note .= '<br><br><strong>🔧 Action Required - Top up your merchant wallet:</strong><br>';
+                $insufficient_funds_note .= sprintf(
+                    /* translators: %s: description of the balance required */
+                    __('You need %s available. A wallet holding only the refund amount cannot send it.', 'stablecoin-pay'),
+                    $this->describe_required_balance($amount, $token_symbol)
+                ) . '<br><br>';
+                $insufficient_funds_note .= $this->get_dashboard_limit_instruction() . '<br><br>';
                 
                 $insufficient_funds_note .= '<strong>To add funds:</strong><br>';
                 $settings_label = $this->get_title();
@@ -1502,12 +1684,19 @@ class WC_Gateway_SP extends WC_Payment_Gateway {
                 return new WP_Error('insufficient_funds', $error_message);
             }
             
-            // Other API errors
+            // Other API errors. The signing limit is the usual culprit and the only
+            // thing the merchant can act on from here, so always point at it.
             $refund_note = sprintf(
                 __('REFUND FAILED: %s. Reason: %s. API Error: %s', 'stablecoin-pay'),
                 wc_price($amount),
                 $reason,
                 $error_message
+            );
+            $refund_note .= '<br><br>' . $this->get_dashboard_limit_instruction();
+            $refund_note .= '<br><br>' . sprintf(
+                /* translators: %s: description of the balance required */
+                __('Also check the wallet holds %s.', 'stablecoin-pay'),
+                $this->describe_required_balance($amount, $token_symbol)
             );
             $order->add_order_note($refund_note);
             error_log('PP Refund: API Error: ' . $error_message);
@@ -1518,7 +1707,7 @@ class WC_Gateway_SP extends WC_Payment_Gateway {
         if (!is_array($refund_result) || empty($refund_result)) {
             error_log('PP Refund: API returned invalid response: ' . json_encode($refund_result));
             $refund_note = sprintf(
-                __('REFUND FAILED: %s. Reason: %s. API returned invalid response. Please try again or process manually.', 'stablecoin-pay'),
+                __('REFUND FAILED: %s. Reason: %s. The API accepted the request but returned nothing we could read, so the transfer may or may not have been submitted. Check the transfer in your merchant dashboard BEFORE retrying - retrying a transfer that already went through would refund the customer twice.', 'stablecoin-pay'),
                 wc_price($amount),
                 $reason
             );
@@ -1528,10 +1717,69 @@ class WC_Gateway_SP extends WC_Payment_Gateway {
         }
         
         error_log('PP Refund: API response received: ' . json_encode($refund_result));
+        error_log('PP Refund: Response shape: ' . SP_API_Client::describe_shape($refund_result));
+        error_log('PP Refund: Reported transfer status: ' . (SP_API_Client::extract_transfer_status($refund_result) ?: '(none)'));
+
+        // The request was accepted, but a transfer above the merchant's signing
+        // limit is created without being broadcast. Nothing reaches the chain until
+        // it is signed, and no `transfer` webhook will ever arrive, so treating this
+        // as a completed refund is how a refund "succeeds" while doing nothing.
+        if (SP_API_Client::transfer_awaits_signature($refund_result)) {
+            $limit = $this->get_refund_signing_limit();
+
+            $action = sprintf(
+                /* translators: 1: refund amount, 2: signing limit */
+                __('This transfer is %1$s, which is above the signing limit on your merchant wallet (default %2$s). It has been created but will NOT reach the blockchain until the limit is raised.', 'stablecoin-pay'),
+                wc_price($amount),
+                wc_price($limit)
+            ) . '<br><br>' . $this->get_dashboard_limit_instruction()
+              . '<br><br><strong>' . __('Do not click refund again first.', 'stablecoin-pay') . '</strong> '
+              . __('A transfer for this order already exists; requesting another before checking the dashboard would refund the customer twice.', 'stablecoin-pay');
+
+            $order->add_order_note($this->build_refund_action_note(
+                $amount,
+                __('⚠️ REFUND AWAITING YOUR SIGNATURE - no funds have moved yet', 'stablecoin-pay'),
+                $action
+            ));
+
+            $pending_id = SP_API_Client::extract_transfer_id($refund_result);
+            if ($pending_id !== '') {
+                $order->update_meta_data('_sp_refund_id', $pending_id);
+            }
+            $order->update_meta_data('_sp_refund_pending', 'yes');
+            $order->update_meta_data('_sp_refund_status', 'awaiting_signature');
+            $order->save();
+
+            error_log('PP Refund: ⚠️ transfer is awaiting merchant signature - nothing sent on-chain yet');
+
+            // Deliberately an error: WooCommerce must not record this as a completed
+            // refund while the funds are still sitting in the merchant wallet.
+            return new WP_Error(
+                'sp_awaiting_signature',
+                sprintf(
+                    __('Refund created but awaiting your signature. It is over the %s signing limit - approve it (or raise the limit) in your merchant dashboard. Do not retry, the transfer already exists.', 'stablecoin-pay'),
+                    wc_price($limit)
+                )
+            );
+        }
         
-        // Success - add order note and update status
-        $refund_id = $refund_result['refund_id'] ?? $refund_result['transfer_id'] ?? 'N/A';
-        $transaction_hash = $refund_result['transaction_hash'] ?? $refund_result['hash'] ?? 'N/A';
+        // Success - add order note and update status.
+        //
+        // Read these tolerantly (envelopes, alternate key names). The identifier is
+        // what matches the later `transfer` webhook back to this order, and the
+        // previous code fell back to the literal string 'N/A' - which is non-empty,
+        // so it was stored as though it were a real id and no incoming transfer
+        // could ever match it. An empty string is the honest answer when the
+        // response does not carry one.
+        $refund_id = SP_API_Client::extract_transfer_id($refund_result);
+        $transaction_hash = SP_API_Client::extract_transaction_hash($refund_result);
+
+        if ($refund_id === '') {
+            // Not fatal: the webhook handler can still tie the transfer back to this
+            // order by destination_email against orders flagged _sp_refund_pending.
+            error_log('PP Refund: response carried no transfer id - relying on the email fallback to confirm. Response keys: '
+                . implode(', ', array_keys((array) $refund_result)));
+        }
         
         // Prefer network name from webhook; fall back to chain_id map for older orders
         $network_name = $order->get_meta('_sp_network_name');
@@ -1545,7 +1793,7 @@ class WC_Gateway_SP extends WC_Payment_Gateway {
             wc_price($amount),
             $reason,
             $customer_wallet ?: $to_address,
-            $refund_id,
+            $refund_id !== '' ? $refund_id : __('pending (not returned by the API)', 'stablecoin-pay'),
             $token_symbol,
             $network_name
         );
@@ -1563,7 +1811,7 @@ class WC_Gateway_SP extends WC_Payment_Gateway {
         $order->update_meta_data('_sp_refund_pending', 'yes');
         $order->update_meta_data('_sp_refund_status', 'pending');
         
-        if (!empty($refund_id)) {
+        if (!empty($refund_id) && $refund_id !== 'N/A') {
             $order->update_meta_data('_sp_refund_id', $refund_id);
             error_log('PP Refund: Stored refund ID: ' . $refund_id);
         }
@@ -1689,7 +1937,19 @@ class WC_Gateway_SP extends WC_Payment_Gateway {
             '295' => 'Hedera Mainnet',
             '296' => 'Hedera Testnet'
         );
-        
+
+        // Display names only - nothing branches on this. Filterable so a chain can
+        // be named without a plugin release; settlement networks change (Ink is not
+        // listed above yet, so refunds there currently read "Chain ID <n>").
+        //
+        //     add_filter('sp_network_names', function ($names) {
+        //         $names['<ink chain id>'] = 'Ink';
+        //         return $names;
+        //     });
+        $networks = apply_filters('sp_network_names', $networks);
+
+        // Prefer the network name the API itself reported for this order, so the
+        // note matches the provider's own wording ("PolygonAmoy", "Ink", ...).
         return isset($networks[$chain_id]) ? $networks[$chain_id] : 'Chain ID ' . $chain_id;
     }
 
@@ -1804,7 +2064,10 @@ class WC_Gateway_SP extends WC_Payment_Gateway {
      * @return string
      */
     public function generate_sp_readonly_url_html($key, $data) {
-        $data = wp_parse_args($data, array('title' => '', 'description' => ''));
+        $data = wp_parse_args($data, array('title' => '', 'description' => '', 'value' => null));
+
+        // Fields may supply the value directly; otherwise it is resolved by key.
+        $value = $data['value'] !== null ? $data['value'] : $this->get_option($key);
 
         ob_start();
         ?>
@@ -1812,7 +2075,7 @@ class WC_Gateway_SP extends WC_Payment_Gateway {
             <th scope="row" class="titledesc"><?php echo wp_kses_post($data['title']); ?></th>
             <td class="forminp">
                 <code style="display:inline-block;padding:6px 10px;background:#f0f0f1;border-radius:3px;word-break:break-all;"><?php
-                    echo esc_html($this->get_option('webhook_url'));
+                    echo esc_html($value);
                 ?></code>
                 <?php if (!empty($data['description'])) : ?>
                     <p class="description"><?php echo wp_kses_post($data['description']); ?></p>
@@ -1833,6 +2096,75 @@ class WC_Gateway_SP extends WC_Payment_Gateway {
      */
     public function validate_sp_readonly_url_field($key, $value) {
         return '';
+    }
+
+    /**
+     * The domain the merchant must submit for whitelist approval.
+     *
+     * This is the origin that embeds the checkout widget, so it must be the store's
+     * own host - taken from the site rather than typed, because a mistyped domain
+     * fails approval silently and the checkout modal simply never loads.
+     *
+     * @return string e.g. shop.example.com
+     */
+    public function get_store_domain() {
+        $host = wp_parse_url(home_url(), PHP_URL_HOST);
+        return $host ? $host : '';
+    }
+
+    /**
+     * Whether the store domain could ever be approved.
+     *
+     * A local or private host is not reachable by the reviewer and cannot embed the
+     * widget in production, so flagging it here saves a rejected submission.
+     *
+     * @return bool
+     */
+    private function store_domain_is_public() {
+        $host = $this->get_store_domain();
+        if ($host === '') {
+            return false;
+        }
+
+        if (in_array($host, array('localhost', '127.0.0.1', '::1'), true)) {
+            return false;
+        }
+        foreach (array('.local', '.test', '.localhost', '.invalid', '.example', '.internal') as $suffix) {
+            if (substr($host, -strlen($suffix)) === $suffix) {
+                return false;
+            }
+        }
+        if (filter_var($host, FILTER_VALIDATE_IP)) {
+            return (bool) filter_var($host, FILTER_VALIDATE_IP, FILTER_FLAG_NO_PRIV_RANGE | FILTER_FLAG_NO_RES_RANGE);
+        }
+
+        return true;
+    }
+
+    /**
+     * Description shown under the Store Domain row.
+     */
+    public function get_domain_whitelist_description() {
+        $dashboard_url = $this->get_dashboard_url_from_config();
+
+        $where = $dashboard_url
+            ? sprintf(
+                /* translators: %s: linked dashboard hostname */
+                __('Submit this domain in your dashboard at %s under <strong>Settings &rarr; Domain Whitelist</strong>.', 'stablecoin-pay'),
+                '<a href="' . esc_url($dashboard_url) . '" target="_blank" rel="noopener">'
+                    . esc_html(wp_parse_url($dashboard_url, PHP_URL_HOST) ?: $dashboard_url) . '</a>'
+            )
+            : __('Submit this domain in your merchant dashboard under <strong>Settings &rarr; Domain Whitelist</strong>.', 'stablecoin-pay');
+
+        $why = __('Checkout is shown in an embedded window, and each store domain is reviewed before it is allowed to embed it. Until this domain is approved, customers cannot complete a payment.', 'stablecoin-pay');
+
+        if (!$this->store_domain_is_public()) {
+            return $where . ' ' . $why . '<br><strong style="color:#b26200;">'
+                 . esc_html__('This looks like a local or private address, which cannot be approved. Submit your live store domain once the site is public.', 'stablecoin-pay')
+                 . '</strong>';
+        }
+
+        return $where . ' ' . $why;
     }
 
     /**
@@ -1891,10 +2223,18 @@ class WC_Gateway_SP extends WC_Payment_Gateway {
             $dashboard_link = '<a href="' . esc_url($dashboard_url) . '" target="_blank" rel="noopener">' . esc_html($host ?: $dashboard_url) . '</a>';
         }
         $login_phrase = $dashboard_link ? sprintf(__('Log in to your account at %s', 'stablecoin-pay'), $dashboard_link) : __('Log in to your account', 'stablecoin-pay');
-        // Repeat the dashboard URL in Steps 1 + 2 so the merchant doesn't have
-        // to scroll back up to find where to go after switching tabs.
+        $whitelist_nav_phrase = $dashboard_link
+            ? sprintf(
+                /* translators: %s: linked dashboard hostname */
+                __('In your dashboard at %s, open <strong>Settings &rarr; Domain Whitelist</strong>', 'stablecoin-pay'),
+                $dashboard_link
+            )
+            : __('In your merchant dashboard, open <strong>Settings &rarr; Domain Whitelist</strong>', 'stablecoin-pay');
+        // Repeat the dashboard URL in every step that sends the merchant there, so
+        // they don't have to scroll back up after switching tabs.
         // Step 1 (credentials) lives under Settings → API Keys.
-        // Step 2 (webhook URL) lives under Settings → Webhooks, where the merchant adds a webhook entry.
+        // Step 3 (domain whitelist) lives under Settings → Domain Whitelist.
+        // Step 2 no longer sends them anywhere: the webhook registers itself.
         if ($dashboard_link) {
             $nav_dashboard_phrase = sprintf(
                 /* translators: %s: linked dashboard hostname (e.g. app.paymentservers.com) */
@@ -1905,10 +2245,10 @@ class WC_Gateway_SP extends WC_Payment_Gateway {
             $nav_dashboard_phrase = __('Navigate to <strong>Settings &rarr; API Keys</strong> in your dashboard', 'stablecoin-pay');
         }
 
-        $step3_title = $plugin_name ? sprintf(__('Step 3: Enable %s', 'stablecoin-pay'), esc_html($plugin_name)) : __('Step 3: Enable payment provider', 'stablecoin-pay');
+        $step4_title = $plugin_name ? sprintf(__('Step 4: Enable %s', 'stablecoin-pay'), esc_html($plugin_name)) : __('Step 4: Enable payment provider', 'stablecoin-pay');
         $important_phrase = $plugin_name
-            ? sprintf(__('<strong>⚠️ Important:</strong> %s works alongside other payment methods. Make sure to complete ALL steps above, especially the webhook configuration!', 'stablecoin-pay'), esc_html($plugin_name))
-            : __('<strong>⚠️ Important:</strong> The payment provider works alongside other payment methods. Make sure to complete ALL steps above, especially the webhook configuration!', 'stablecoin-pay');
+            ? sprintf(__('<strong>⚠️ Important:</strong> %s works alongside other payment methods. Make sure to complete ALL steps above. The webhook is registered for you, but the domain whitelist in Step 3 is a manual approval and checkout will not load until it is granted.', 'stablecoin-pay'), esc_html($plugin_name))
+            : __('<strong>⚠️ Important:</strong> The payment provider works alongside other payment methods. Make sure to complete ALL steps above. The webhook is registered for you, but the domain whitelist in Step 3 is a manual approval and checkout will not load until it is granted.', 'stablecoin-pay');
 
         $subscription_checkbox = $plugin_name
             ? sprintf(__('"%s Subscription"', 'stablecoin-pay'), esc_html($plugin_name))
@@ -1959,7 +2299,22 @@ class WC_Gateway_SP extends WC_Payment_Gateway {
             <li><?php echo __('The <strong>Webhook URL</strong> below is shown for reference only. You do not need to copy it anywhere.', 'stablecoin-pay'); ?></li>
             <li><?php echo __('If registration fails you will see a notice here with a <strong>Retry webhook setup</strong> button. Payments keep working either way, but orders will not update until the webhook is registered.', 'stablecoin-pay'); ?></li>
         </ol>
-        <h4 style="margin:1.5em 0 .5em"><?php echo $step3_title; ?></h4>
+        <h4 style="margin:1.5em 0 .5em"><?php esc_html_e('Step 3: Whitelist your store domain', 'stablecoin-pay'); ?></h4>
+        <div style="margin:0 0 10px;padding:12px;background:#fef3c7;border:1px solid #998843;border-radius:4px">
+            <p style="margin:0 0 8px"><strong><?php esc_html_e('Required before customers can pay.', 'stablecoin-pay'); ?></strong>
+            <?php esc_html_e('Checkout opens in an embedded window, and each store domain is reviewed before it is allowed to embed it.', 'stablecoin-pay'); ?></p>
+            <ol style="line-height:1.6;margin:0">
+                <li><?php echo sprintf(
+                    /* translators: %s: this store's domain, e.g. shop.example.com */
+                    __('Copy your store domain: %s', 'stablecoin-pay'),
+                    '<code style="padding:2px 6px;background:#fff;border-radius:3px">' . esc_html($this->get_store_domain()) . '</code>'
+                ); ?></li>
+                <li><?php echo $whitelist_nav_phrase; ?></li>
+                <li><?php esc_html_e('Paste the domain, submit it, and wait for approval.', 'stablecoin-pay'); ?></li>
+                <li><em><?php esc_html_e('Until it is approved the checkout window will not load, even though everything else is configured correctly.', 'stablecoin-pay'); ?></em></li>
+            </ol>
+        </div>
+        <h4 style="margin:1.5em 0 .5em"><?php echo $step4_title; ?></h4>
         <ol style="line-height:1.6;margin-top:0">
             <li><?php echo sprintf(__('Check the <strong>%s</strong> box below', 'stablecoin-pay'), esc_html($this->get_enable_label())); ?></li>
             <li><?php echo __('Click <strong>Save changes</strong>', 'stablecoin-pay'); ?></li>
