@@ -760,7 +760,16 @@ class SP_Webhook_Handler {
         $refund_id = $order->get_meta('_sp_refund_id');
         $refund_pending = $order->get_meta('_sp_refund_pending');
         
-        if ($refund_pending === 'yes' || !empty($refund_id)) {
+        // Treat this as a refund payout if anything says so: the pending flag, a
+        // stored transfer id, a refund already recorded against the order, or the
+        // order sitting in refund-pending. Missing any of these would send the
+        // order to "processing" instead of "refunded" after the money went back.
+        $looks_like_refund = ($refund_pending === 'yes')
+            || !empty($refund_id)
+            || $order->get_total_refunded() > 0
+            || in_array($order->get_status(), array('refund-pending', 'refunded'), true);
+
+        if ($looks_like_refund) {
             error_log('💰 PP Webhook: This is a refund transfer - refund ID: ' . ($refund_id ?: 'N/A'));
             
             $order->update_meta_data('_sp_refund_status', 'completed');

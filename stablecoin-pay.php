@@ -883,6 +883,57 @@ function sp_checkout_page_shortcode($atts) {
 
 // Hook into WordPress
 add_action('plugins_loaded', 'sp_commerce_init');
+
+/**
+ * Register the plugin's custom order status.
+ *
+ * The refund flow moves orders to `refund-pending` while a payout is in flight.
+ * WC_Abstract_Order::set_status() silently falls back to `pending` for any status
+ * it does not recognise, so without this registration those orders were stamped
+ * "Pending payment" - which reads as unpaid, on an order that was in fact paid and
+ * being refunded.
+ */
+function sp_register_order_statuses() {
+    register_post_status('wc-refund-pending', array(
+        'label'                     => _x('Refund pending', 'Order status', 'stablecoin-pay'),
+        'public'                    => false,
+        'exclude_from_search'       => false,
+        'show_in_admin_all_list'    => true,
+        'show_in_admin_status_list' => true,
+        /* translators: %s: order count */
+        'label_count'               => _n_noop(
+            'Refund pending <span class="count">(%s)</span>',
+            'Refund pending <span class="count">(%s)</span>',
+            'stablecoin-pay'
+        ),
+    ));
+}
+add_action('init', 'sp_register_order_statuses');
+
+/**
+ * Make the custom status selectable and visible in the WooCommerce order lists.
+ *
+ * @param array $statuses
+ * @return array
+ */
+function sp_add_order_statuses($statuses) {
+    $reordered = array();
+
+    foreach ($statuses as $key => $label) {
+        $reordered[$key] = $label;
+        // Sit next to the built-in refunded status, where a merchant looks for it.
+        if ($key === 'wc-refunded') {
+            $reordered['wc-refund-pending'] = _x('Refund pending', 'Order status', 'stablecoin-pay');
+        }
+    }
+
+    if (!isset($reordered['wc-refund-pending'])) {
+        $reordered['wc-refund-pending'] = _x('Refund pending', 'Order status', 'stablecoin-pay');
+    }
+
+    return $reordered;
+}
+add_filter('wc_order_statuses', 'sp_add_order_statuses');
 add_filter('woocommerce_payment_gateways', 'sp_add_gateway_class');
 add_action('before_woocommerce_init', 'sp_commerce_declare_hpos_compatibility');
 
