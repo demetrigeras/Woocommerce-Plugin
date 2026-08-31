@@ -29,7 +29,7 @@ class SP_Legacy_Migration {
     const VERSION_OPTION = 'sp_legacy_migration_version';
 
     /** Bump when a new migration step is added below. */
-    const CURRENT_VERSION = 1;
+    const CURRENT_VERSION = 2;
 
     const LEGACY_PREFIX = 'coinsub';
     const NEW_PREFIX    = 'sp';
@@ -59,6 +59,7 @@ class SP_Legacy_Migration {
             self::migrate_payment_method();
             self::purge_legacy_transients();
             self::migrate_scheduled_events();
+            self::drop_obsolete_branding_cache();
 
             update_option(self::VERSION_OPTION, self::CURRENT_VERSION, false);
             error_log('Stablecoin Pay Migration: legacy "coinsub" keys migrated to "sp" (v' . self::CURRENT_VERSION . ')');
@@ -83,7 +84,6 @@ class SP_Legacy_Migration {
             // WooCommerce derives this option name from the gateway id.
             'woocommerce_coinsub_settings' => 'woocommerce_sp_settings',
             'coinsub_checkout_page_id'     => 'sp_checkout_page_id',
-            'coinsub_whitelabel_branding'  => 'sp_whitelabel_branding',
             'coinsub_webhook_secret'       => 'sp_webhook_secret',
         );
 
@@ -284,6 +284,34 @@ class SP_Legacy_Migration {
             wp_schedule_event($next, 'hourly', $new_hook);
         }
         error_log('Stablecoin Pay Migration: cleanup cron re-hooked to ' . $new_hook);
+    }
+
+    /**
+     * Remove the branding cache left by builds that fetched branding from the API.
+     *
+     * Branding now comes only from sp-whitelabel-config.php, so these rows are dead
+     * weight - and worse, they are a snapshot of whatever partner the site last
+     * talked to, which is exactly the sort of stale value someone would later
+     * mistake for configuration.
+     */
+    private static function drop_obsolete_branding_cache() {
+        global $wpdb;
+
+        delete_option('sp_whitelabel_branding');
+        delete_option('coinsub_whitelabel_branding');
+
+        delete_transient('sp_whitelabel_fetching');
+        delete_transient('sp_whitelabel_fetching_time');
+        delete_transient('sp_refresh_branding_on_load');
+
+        // Per-merchant branding fetch guards, if any survived.
+        $wpdb->query(
+            "DELETE FROM {$wpdb->options}
+              WHERE option_name LIKE '_transient_sp_branding_fetch_attempted_%'
+                 OR option_name LIKE '_transient_timeout_sp_branding_fetch_attempted_%'"
+        );
+
+        error_log('Stablecoin Pay Migration: removed the obsolete API branding cache');
     }
 
     // ----------------------------------------------------------------- helpers

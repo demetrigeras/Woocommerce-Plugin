@@ -262,11 +262,6 @@ class SP_Checkout_Page_Checker {
 
    
     private static function get_brand_name() {
-        $branding = get_option('sp_whitelabel_branding', array());
-        if (!empty($branding['company_name'])) {
-            return $branding['company_name'];
-        }
-
         $config_file = SP_PLUGIN_DIR . 'sp-whitelabel-config.php';
         if (file_exists($config_file)) {
             $config = include $config_file;

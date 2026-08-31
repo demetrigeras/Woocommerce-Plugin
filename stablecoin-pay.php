@@ -548,9 +548,10 @@ function sp_checkout_page_shortcode($atts) {
     // REMOVED: Domain blocking check - these domains work fine in iframes
     // The JavaScript fallback will handle redirect if iframe is actually blocked by X-Frame-Options
     
-    // Get whitelabel branding for page title (use cached data only, no API calls)
-    $branding_data = get_option('sp_whitelabel_branding', array());
-    $company_name = !empty($branding_data['company']) ? $branding_data['company'] : 'Stablecoin Pay';
+    // Page title comes from the whitelabel config.
+    $company_name = class_exists('SP_Whitelabel_Branding')
+        ? (SP_Whitelabel_Branding::get_whitelabel_plugin_name_from_config() ?: 'Stablecoin Pay')
+        : 'Stablecoin Pay';
     
     error_log('📝 PP Checkout Page: Starting output buffer, company: ' . $company_name);
     

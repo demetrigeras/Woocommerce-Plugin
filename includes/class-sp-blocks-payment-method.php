@@ -135,19 +135,13 @@ class SP_Blocks_Payment_Method extends \Automattic\WooCommerce\Blocks\Payments\I
             ? $this->settings['description']
             : __('Pay securely with stablecoin.', 'stablecoin-pay');
 
-        // Whitelabel branding (logo, etc.) — same source as classic checkout.
-        $branding = get_option('sp_whitelabel_branding', array());
-
-        // Logo/company resolution mirrors the classic gateway: on a partner build the config file
-        // wins outright. The sp_whitelabel_branding option is a cache of whatever the API last
-        // returned, so if it took precedence a site that previously ran another partner's build
-        // would keep showing that partner's logo and name. No partner asset is named here — the
-        // only per-company values live in sp-whitelabel-config.php.
+        // Logo and company name come from sp-whitelabel-config.php, the single source
+        // for a build. No partner asset is named here.
         $config_logo = class_exists('SP_Whitelabel_Branding')
             ? SP_Whitelabel_Branding::get_whitelabel_logo_url_from_config()
             : null;
-        $logo_url = $config_logo ?: (!empty($branding['logo_url']) ? $branding['logo_url'] : '');
-        $company_name = $config_name ?: (!empty($branding['company_name']) ? $branding['company_name'] : 'Stablecoin Pay');
+        $logo_url = $config_logo ?: '';
+        $company_name = $config_name ?: 'Stablecoin Pay';
 
         return array(
             'title'           => $brand_name,

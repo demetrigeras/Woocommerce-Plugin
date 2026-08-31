@@ -63,18 +63,7 @@ class WC_Gateway_SP extends WC_Payment_Gateway {
         // CRITICAL: Only load whitelabel branding on frontend (checkout), NOT in admin
         // Admin/settings page should always show "Stablecoin Pay"
         if (!is_admin()) {
-            // Check if we need to refresh branding (deferred from previous save)
-            // This prevents timeout during save - branding fetch happens on next page load
-            $refresh_branding = get_transient('sp_refresh_branding_on_load');
-            if ($refresh_branding) {
-                error_log('PP Whitelabel: 🔄 Deferred branding fetch triggered - fetching now...');
-                delete_transient('sp_refresh_branding_on_load');
-                // Load branding with force refresh (this will make API calls)
-                $this->load_whitelabel_branding(true);
-            } else {
-                // Load whitelabel branding from cache only (no API calls)
-                $this->load_whitelabel_branding(false);
-            }
+            $this->load_whitelabel_branding();
         } else {
             // In admin: use config display name when set (no hardcoding elsewhere). Logo from config only (no bundled default image).
             $this->checkout_title = $config_name ? ('Pay with ' . $config_name) : 'Pay with Stablecoin Pay';
@@ -395,11 +384,7 @@ class WC_Gateway_SP extends WC_Payment_Gateway {
                 return 'https://api.' . $config_env_id . '/v1';
             }
         }
-        // 3. Non-partner build: whatever branding the API last reported
-        $branding = get_option('sp_whitelabel_branding', false);
-        if ($branding && is_array($branding) && !empty($branding['environment_id'])) {
-            return 'https://api.' . $branding['environment_id'] . '/v1';
-        }
+        // 3. Non-partner build: the default host.
         return 'https://api.coinsub.io/v1';
     }
 
@@ -417,10 +402,6 @@ class WC_Gateway_SP extends WC_Payment_Gateway {
                 return 'https://app.' . $config_env_id;
             }
         }
-        $branding = get_option('sp_whitelabel_branding', false);
-        if ($branding && is_array($branding) && !empty($branding['environment_id'])) {
-            return 'https://app.' . $branding['environment_id'];
-        }
         return 'https://app.coinsub.io';
     }
     
@@ -433,161 +414,32 @@ class WC_Gateway_SP extends WC_Payment_Gateway {
      * @param bool $force_refresh If true, force API call to refresh branding. If false, use cache only.
      */
     private function load_whitelabel_branding($force_refresh = false) {
-        // Prevent multiple loads in the same request (gateway is instantiated multiple times)
-        static $branding_loaded = false;
-        static $cached_branding = null;
-        
-        error_log('PP Whitelabel: 🔍 Cache check - branding_loaded: ' . ($branding_loaded ? 'YES' : 'NO') . ', force_refresh: ' . ($force_refresh ? 'YES' : 'NO'));
-        
-        if ($branding_loaded && !$force_refresh) {
-            error_log('PP Whitelabel: ⚡ Using cached branding from previous load in same request');
-            // Restore cached values
-            if ($cached_branding) {
-                $this->brand_company = $cached_branding['brand_company'];
-                $this->checkout_title = $cached_branding['checkout_title'];
-                $this->checkout_icon = $cached_branding['checkout_icon'];
-                $this->button_logo_url = $cached_branding['button_logo_url'];
-                $this->button_company_name = $cached_branding['button_company_name'];
-                error_log('PP Whitelabel: ⚡ Restored branding - Title: "' . $this->checkout_title . '", Company: "' . $this->brand_company . '"');
-            }
-            return;
+        // Config-only. Branding used to be fetched from the API and cached in an
+        // option; that lookup is gone, so there is nothing to refresh and nothing
+        // that can disagree with the build. $force_refresh is kept only so existing
+        // call sites stay valid.
+        unset($force_refresh);
+
+        $company_name = class_exists('SP_Whitelabel_Branding')
+            ? SP_Whitelabel_Branding::get_whitelabel_plugin_name_from_config()
+            : null;
+        $logo_url = class_exists('SP_Whitelabel_Branding')
+            ? SP_Whitelabel_Branding::get_whitelabel_logo_url_from_config()
+            : null;
+
+        if (empty($company_name)) {
+            $company_name = 'Stablecoin Pay';
         }
-        
-        error_log('PP Whitelabel: Loading branding for CHECKOUT ONLY (force_refresh: ' . ($force_refresh ? 'yes' : 'no') . ')...');
-        
-        // Partner build (whitelabel config): use config for checkout name + logo only — no API/database lookup
-        $env_id = class_exists('SP_Whitelabel_Branding') ? SP_Whitelabel_Branding::get_whitelabel_env_id_from_config() : null;
-        if (!empty($env_id)) {
-            $plugin_name = SP_Whitelabel_Branding::get_whitelabel_plugin_name_from_config();
-            $this->brand_company = $plugin_name ?: 'Stablecoin Pay';
-            $this->checkout_title = 'Pay with ' . $this->brand_company;
-            $this->button_company_name = $this->brand_company;
-            $logo_url = SP_Whitelabel_Branding::get_whitelabel_logo_url_from_config();
-            if (empty($logo_url)) {
-                $logo_url = '';
-            }
-            $this->checkout_icon = $logo_url;
-            $this->button_logo_url = $logo_url;
-            $branding_loaded = true;
-            $cached_branding = array(
-                'brand_company' => $this->brand_company,
-                'checkout_title' => $this->checkout_title,
-                'checkout_icon' => $this->checkout_icon,
-                'button_logo_url' => $this->button_logo_url,
-                'button_company_name' => $this->button_company_name,
-            );
-            error_log('PP Whitelabel: ✅ Checkout from config only (no lookup) - Title: "' . $this->checkout_title . '", Logo: ' . $logo_url);
-            return;
+
+        $this->brand_company        = $company_name;
+        $this->checkout_title       = 'Pay with ' . $company_name;
+        $this->checkout_icon        = $logo_url ? $logo_url : '';
+        $this->button_logo_url      = $logo_url ? $logo_url : '';
+        $this->button_company_name  = $company_name;
+
+        if (is_checkout()) {
+            error_log('PP Whitelabel: checkout branding from config - "' . $this->checkout_title . '"');
         }
-        
-        // Stablecoin Pay (no whitelabel config): check credentials and use API/database for branding
-        // CRITICAL FIX: Check if credentials exist before loading branding
-        // This prevents old branding (e.g., "Vantack") from showing when credentials are removed
-        $merchant_id = $this->get_option('merchant_id');
-        $api_key = $this->get_option('api_key');
-        
-        if (empty($merchant_id) && empty($api_key)) {
-            error_log('PP Whitelabel: ⚠️ No credentials - clearing old branding and using defaults');
-        $branding = new SP_Whitelabel_Branding();
-            $branding->clear_cache(); // Clear any old branding from previous merchant
-            $this->brand_company = 'Stablecoin Pay';
-            // Store checkout-specific data (NOT $this->title which is for admin). No bundled logo; config logo_url only.
-            $this->checkout_title = 'Pay with Stablecoin Pay';
-            $fallback_logo = SP_Whitelabel_Branding::get_whitelabel_logo_url_from_config();
-            $this->checkout_icon = $fallback_logo ? $fallback_logo : '';
-            $this->button_logo_url = $fallback_logo ? $fallback_logo : '';
-            $this->button_company_name = 'Stablecoin Pay';
-            error_log('PP Whitelabel: ✅ Using default branding (no credentials, no payment provider) - Checkout Title: "Pay with Stablecoin Pay"');
-            
-            // Cache this for subsequent loads
-            $branding_loaded = true;
-            $cached_branding = array(
-                'brand_company' => $this->brand_company,
-                'checkout_title' => $this->checkout_title,
-                'checkout_icon' => $this->checkout_icon,
-                'button_logo_url' => $this->button_logo_url,
-                'button_company_name' => $this->button_company_name,
-            );
-            error_log('PP Whitelabel: 💾 Cached default branding');
-            return;
-        }
-        
-        // Credentials exist - proceed with branding load
-        $branding = new SP_Whitelabel_Branding();
-        $branding_data = $branding->get_branding($force_refresh);
-        
-        // FALLBACK: If no branding found but credentials exist, try to fetch it once
-        // This handles the case where a new site has credentials but branding wasn't fetched yet
-        if (empty($branding_data) && !$force_refresh) {
-            // Check if we've already tried to fetch in this session (prevent infinite loops)
-            $fetch_attempted = get_transient('sp_branding_fetch_attempted_' . $merchant_id);
-            if (!$fetch_attempted) {
-                error_log('PP Whitelabel: ⚠️ No branding found but credentials exist - attempting one-time fetch...');
-                set_transient('sp_branding_fetch_attempted_' . $merchant_id, true, 300); // 5 minute lock
-                $branding_data = $branding->get_branding(true); // Force refresh
-                if (!empty($branding_data) && isset($branding_data['company'])) {
-                    error_log('PP Whitelabel: ✅ Successfully fetched branding on checkout - Company: "' . $branding_data['company'] . '"');
-                } else {
-                    error_log('PP Whitelabel: ⚠️ Fetch attempt failed or returned empty - will use default');
-                }
-            }
-        }
-        
-        // Only update if branding data exists and has company name
-        if (!empty($branding_data) && isset($branding_data['company']) && !empty($branding_data['company'])) {
-        $company_name = $branding_data['company'];
-            $this->brand_company = $company_name;
-            // Store checkout-specific title (NOT $this->title which is for admin)
-            $this->checkout_title = 'Pay with ' . $company_name;
-        
-            error_log('PP Whitelabel: ✅ CHECKOUT TITLE SET - Title: "' . $this->checkout_title . '" | Company: "' . $company_name . '" | brand_company property: "' . $this->brand_company . '"');
-            
-            // Update checkout icon - prefer favicon (smaller, better for payment method icon)
-            $favicon_url = $branding->get_favicon_url();
-            if ($favicon_url) {
-                $this->checkout_icon = $favicon_url;
-                error_log('PP Whitelabel: 🖼️ ✅ Set checkout icon to favicon: ' . $favicon_url);
-            } else {
-                // Fallback to default logo
-                $logo_url = $branding->get_logo_url('default', 'light');
-                if ($logo_url) {
-                    $this->checkout_icon = $logo_url;
-                    error_log('PP Whitelabel: 🖼️ ✅ Set checkout icon to logo: ' . $logo_url);
-                } else {
-                    error_log('PP Whitelabel: 🖼️ ⚠️ No logo URL returned (config/API only, no bundled icon)');
-                    $this->checkout_icon = '';
-                }
-            }
-            
-            // For button logo (larger), use the default logo; no bundled default image fallback
-            $logo_url = $branding->get_logo_url('default', 'light');
-            $this->button_logo_url = $logo_url ? $logo_url : '';
-            $this->button_company_name = $company_name;
-            error_log('PP Whitelabel: 🔘 Button logo URL set: ' . $this->button_logo_url);
-        } else {
-            // No branding found - use default "Pay with Stablecoin Pay"; logo from config only (no bundled image)
-            error_log('PP Whitelabel: ⚠️ No branding data found - using default "Pay with Stablecoin Pay"');
-            $this->brand_company = 'Stablecoin Pay';
-            $this->checkout_title = 'Pay with Stablecoin Pay';
-            $fallback_logo = SP_Whitelabel_Branding::get_whitelabel_logo_url_from_config();
-            $this->checkout_icon = $fallback_logo ? $fallback_logo : '';
-            $this->button_logo_url = $fallback_logo ? $fallback_logo : '';
-            $this->button_company_name = 'Stablecoin Pay';
-            error_log('PP Whitelabel: ✅ Set default checkout title: "' . $this->checkout_title . '"');
-            error_log('PP Whitelabel: 🔘 Button logo URL: ' . ($this->button_logo_url ? $this->button_logo_url : '(none)'));
-        }
-        
-        // Cache the branding for subsequent gateway instances in the same request
-        // This prevents the second instance from clearing the branding
-        $branding_loaded = true;
-        $cached_branding = array(
-            'brand_company' => $this->brand_company,
-            'checkout_title' => $this->checkout_title,
-            'checkout_icon' => $this->checkout_icon,
-            'button_logo_url' => $this->button_logo_url,
-            'button_company_name' => $this->button_company_name,
-        );
-        error_log('PP Whitelabel: 💾 Cached branding for subsequent loads - Title: "' . $this->checkout_title . '", Company: "' . $this->brand_company . '"');
     }
     
     /**
@@ -664,43 +516,9 @@ class WC_Gateway_SP extends WC_Payment_Gateway {
             error_log('PP Whitelabel: ⚠️ Skipping - no credentials');
             return;
         }
-        
-        // Clear any stuck fetch locks from previous attempts
-        delete_transient('sp_whitelabel_fetching');
-        delete_transient('sp_whitelabel_fetching_time');
-        error_log('PP Whitelabel: 🔓 Cleared any existing fetch locks');
-        
-        // CRITICAL FIX: Try to fetch branding immediately, but don't block if it fails
-        // If immediate fetch fails, it will be retried on next page load
-        error_log('PP Whitelabel: 🔄 Attempting immediate branding fetch...');
-        
-        try {
-            $branding = new SP_Whitelabel_Branding();
-            $branding->clear_cache();
-            
-            // Try immediate fetch with force_refresh=true
-            $branding_data = $branding->get_branding(true);
-            
-            if (!empty($branding_data) && isset($branding_data['company'])) {
-                error_log('PP Whitelabel: ✅✅✅ Branding fetched immediately - Company: "' . $branding_data['company'] . '"');
-            } else {
-                error_log('PP Whitelabel: ⚠️ Immediate fetch returned empty - will retry on next page load');
-                // Set flag to retry on next page load as fallback
-                set_transient('sp_refresh_branding_on_load', true, 60);
-            }
-            
-        } catch (Exception $e) {
-            error_log('PP Whitelabel: ❌ ERROR fetching branding immediately: ' . $e->getMessage() . ' - Will retry on next page load');
-            // Set flag to retry on next page load as fallback
-            set_transient('sp_refresh_branding_on_load', true, 60);
-        } catch (Error $e) {
-            error_log('PP Whitelabel: ❌ FATAL ERROR fetching branding immediately: ' . $e->getMessage() . ' - Will retry on next page load');
-            // Set flag to retry on next page load as fallback
-            set_transient('sp_refresh_branding_on_load', true, 60);
-        }
     }
-    
-    
+
+
     /**
      * Override process_admin_options to ensure our method is called
      * This is called automatically by WooCommerce when settings are saved
@@ -947,8 +765,6 @@ class WC_Gateway_SP extends WC_Payment_Gateway {
             //      than the cached branding option, which is a snapshot of whatever the API last
             //      returned and may still describe a previous build's partner. Using environment_id
             //      also keeps the real TLD (buy.syncharge.io), unlike the .com assumption below.
-            //   3. cached branding option    - non-partner builds driven by API branding only
-            $branding_data = get_option('sp_whitelabel_branding', array());
             $branding_available = class_exists('SP_Whitelabel_Branding');
             $buyurl = $branding_available ? SP_Whitelabel_Branding::get_buy_base_url_override() : null;
             if (empty($buyurl) && $branding_available) {
@@ -956,13 +772,6 @@ class WC_Gateway_SP extends WC_Payment_Gateway {
                 if (!empty($config_env_id)) {
                     $buyurl = 'https://buy.' . $config_env_id;
                 }
-            }
-            if (empty($buyurl) && !empty($branding_data['buyurl'])) {
-                $buyurl = $branding_data['buyurl'];
-            }
-            if (empty($buyurl) && !empty($branding_data['company_slug'])) {
-                // Legacy fallback for non-partner builds. Assumes a .com partner domain.
-                $buyurl = 'https://buy.' . $branding_data['company_slug'] . '.com';
             }
             if (!empty($buyurl)) {
                 $buyurl_parts = parse_url($buyurl);

@@ -37,16 +37,6 @@ class SP_Admin_Subscriptions {
     }
     
     /**
-     * Get whitelabel branding class
-     */
-    private function get_branding() {
-        if (!class_exists('SP_Whitelabel_Branding')) {
-            require_once plugin_dir_path(__FILE__) . 'class-sp-whitelabel-branding.php';
-        }
-        return new SP_Whitelabel_Branding();
-    }
-    
-    /**
      * Check if settings are saved (merchant ID and API key exist)
      */
     private function are_settings_saved() {
@@ -67,13 +57,8 @@ class SP_Admin_Subscriptions {
                 return $name ?: __('Stablecoin Pay', 'stablecoin-pay');
             }
         }
-        // Stablecoin Pay build: use API branding when settings saved, else default
-        if (!$this->are_settings_saved()) {
-            return __('Payment Provider', 'stablecoin-pay');
-        }
-        $branding = $this->get_branding();
-        $branding_data = $branding->get_branding(false);
-        return !empty($branding_data['company']) ? $branding_data['company'] : __('Payment Provider', 'stablecoin-pay');
+        // Non-partner build: no API lookup, just the plugin's own name.
+        return __('Payment Provider', 'stablecoin-pay');
     }
     
     /**

@@ -13,9 +13,12 @@ if (!defined('ABSPATH')) {
 
 get_header();
 
-// Get whitelabel branding
+// Branding comes from sp-whitelabel-config.php - there is no API lookup.
 $whitelabel_branding = new SP_Whitelabel_Branding();
-$branding_data = $whitelabel_branding->get_branding();
+$branding_data = array(
+    'company'    => $whitelabel_branding->get_company_name() ?: __('Stablecoin Pay', 'stablecoin-pay'),
+    'powered_by' => $whitelabel_branding->get_powered_by_text(),
+);
 
 $default_branding = array(
     'title'        => sprintf(__('About %s', 'stablecoin-pay'), $branding_data['company']),
