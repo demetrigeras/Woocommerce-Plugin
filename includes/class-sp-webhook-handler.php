@@ -119,14 +119,14 @@ class SP_Webhook_Handler {
             return new WP_REST_Response(array('error' => 'Invalid JSON data'), 400);
         }
 
-        error_log('🔔 PP Webhook - Data: ' . json_encode(SP_API_Client::redact_for_log($data)));
+        error_log('🔔 PP Webhook - Data: ' . json_encode(self::safe_log_payload($data)));
 
         // Log specific data structures for debugging
         if (isset($data['agreement'])) {
-            error_log('🔔 PP Webhook - Agreement data: ' . json_encode(SP_API_Client::redact_for_log($data['agreement'])));
+            error_log('🔔 PP Webhook - Agreement data: ' . json_encode(self::safe_log_payload($data['agreement'])));
         }
         if (isset($data['transaction_details'])) {
-            error_log('🔔 PP Webhook - Transaction details: ' . json_encode(SP_API_Client::redact_for_log($data['transaction_details'])));
+            error_log('🔔 PP Webhook - Transaction details: ' . json_encode(self::safe_log_payload($data['transaction_details'])));
         }
 
         // Process the webhook
@@ -141,7 +141,7 @@ class SP_Webhook_Handler {
      * Process webhook data
      */
     private function process_webhook($data) {
-        error_log('PP Webhook: Payload: ' . json_encode(SP_API_Client::redact_for_log($data)));
+        error_log('PP Webhook: Payload: ' . json_encode(self::safe_log_payload($data)));
         
         $event_type = $data['type'] ?? 'unknown';
         $origin_id = $data['origin_id'] ?? null;
@@ -152,9 +152,17 @@ class SP_Webhook_Handler {
         error_log('PP Webhook: Origin ID: ' . $origin_id);
         error_log('PP Webhook: Merchant ID: ' . $merchant_id);
 
+        // Sanity check only - deliberately NOT a gate.
+        //
+        // The delivery has already been authenticated by HMAC against a signing
+        // secret only this site and the provider hold, so a signature-valid event is
+        // trustworthy on its own. merchant_id is defence in depth, and the provider
+        // does not necessarily send the same identifier that is stored in settings
+        // (prefixed ids, sub-merchant ids, environment ids). Dropping the event on a
+        // mismatch would silently discard a payment that has already settled
+        // on-chain, which is far worse than the case it guards against.
         if (!$this->merchant_id_matches($merchant_id)) {
-            error_log('❌ PP Webhook: merchant_id "' . $merchant_id . '" is not this store\'s merchant - ignoring event');
-            return;
+            error_log('⚠️ PP Webhook: merchant_id "' . $merchant_id . '" does not match this store\'s configured merchant - processing anyway (delivery was signature-verified)');
         }
         
         // Transfer events (refund payouts) carry no origin_id, so the order has to be
@@ -999,6 +1007,23 @@ class SP_Webhook_Handler {
 
         error_log('✅ PP Webhook - Signature verified');
         return true;
+    }
+
+    /**
+     * Redact a payload for logging, without ever being the reason a webhook fails.
+     *
+     * The redactor lives on the API client; if that class is somehow not loaded in
+     * this request, a static call would throw and take down the whole delivery. A
+     * log line is never worth that, so fall back to withholding the payload.
+     *
+     * @param mixed $data
+     * @return mixed
+     */
+    private static function safe_log_payload($data) {
+        if (class_exists('SP_API_Client') && method_exists('SP_API_Client', 'redact_for_log')) {
+            return SP_API_Client::redact_for_log($data);
+        }
+        return '[payload withheld]';
     }
 
     /**

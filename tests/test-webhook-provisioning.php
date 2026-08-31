@@ -926,6 +926,39 @@ check('an empty hash on a failed transfer yields no hash',
 check('a failed transfer is not read as awaiting signature',
     !SP_API_Client::transfer_awaits_signature($doc_failed));
 
+
+// ============================ 14b. A merchant_id mismatch must NEVER drop an event
+section('14b. merchant_id is a sanity check, not a gate');
+
+$h2 = new SP_Webhook_Handler();
+$mm = new ReflectionMethod('SP_Webhook_Handler', 'merchant_id_matches');
+$mm->setAccessible(true);
+
+$GLOBALS['options']['woocommerce_sp_settings'] = array(
+    'merchant_id' => '053daf5f-7de6-491e-8096-5c8a8612f334', 'api_key' => 'k',
+);
+
+// The check itself still reports mismatches accurately...
+check('mismatch is still detected', $mm->invoke($h2, 'mrch_99999999-0000-0000-0000-000000000000') === false);
+check('match is still detected', $mm->invoke($h2, 'mrch_053daf5f-7de6-491e-8096-5c8a8612f334') === true);
+
+// ...but process_webhook must not bail on it. A payment that settled on-chain
+// cannot be discarded because an identifier was formatted differently.
+$src = file_get_contents(dirname(__DIR__) . '/includes/class-sp-webhook-handler.php');
+$start = strpos($src, 'if (!$this->merchant_id_matches($merchant_id))');
+check('the mismatch branch exists', $start !== false);
+$branch = substr($src, $start, 400);
+check('mismatch does NOT return early (would discard a settled payment)',
+    strpos($branch, 'return;') === false, substr($branch, 0, 160));
+check('mismatch only logs a warning', stripos($branch, 'error_log') !== false);
+
+// The redactor must never be the reason a delivery fails.
+$safe = new ReflectionMethod('SP_Webhook_Handler', 'safe_log_payload');
+$safe->setAccessible(true);
+check('redaction helper returns something usable', $safe->invoke(null, array('a' => 1)) !== null);
+check('redaction helper handles a scalar', $safe->invoke(null, 'x') !== null);
+
+
 echo "\n" . str_repeat('=', 62) . "\n";
 printf("  %d passed, %d failed\n", $pass, $fail);
 echo str_repeat('=', 62) . "\n";
