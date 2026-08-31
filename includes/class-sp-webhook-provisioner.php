@@ -388,7 +388,7 @@ class SP_Webhook_Provisioner {
         // types added since - notably embed_transfer, without which refunds paid
         // from an Embedded Wallet are never confirmed.
         self::request('PUT', 'webhooks/' . $webhook_id, array(
-            'url'                    => $callback_url,
+            'url'                    => self::registration_callback_url(),
             'subscribed_event_types' => self::event_types(),
         ), $credentials);
 
@@ -412,7 +412,7 @@ class SP_Webhook_Provisioner {
     private static function create($callback_url, $credentials) {
         try {
             $response = self::request('POST', 'webhooks', array(
-                'url'                    => $callback_url,
+                'url'                    => self::registration_callback_url(),
                 'subscribed_event_types' => self::event_types(),
             ), $credentials);
         } catch (Exception $e) {
@@ -773,9 +773,45 @@ class SP_Webhook_Provisioner {
 
     /**
      * Derived from the site itself - never asked of the merchant.
+     *
+     * This is the display/canonical form and carries no credential.
      */
     public static function callback_url() {
         return get_rest_url(null, self::CALLBACK_ROUTE);
+    }
+
+    /**
+     * The URL actually registered with the API.
+     *
+     * Deliveries are authenticated one of two ways: an HMAC signature (preferred,
+     * using the secret the API issues at registration) or the site's shared secret
+     * passed back as a query arg (how webhooks worked before provisioning existed).
+     *
+     * Until a signing secret has been issued, a signature cannot be produced or
+     * checked - so registering a bare URL would leave every delivery unverifiable
+     * and rejected. In that window the shared secret goes on the URL so deliveries
+     * can still be authenticated, exactly as they were before. Once a signing
+     * secret exists the next sync registers the clean URL and the credential leaves
+     * the query string for good.
+     *
+     * Note this value is only ever sent server-to-server over HTTPS; the URL shown
+     * in the settings screen is always the clean one.
+     *
+     * @return string
+     */
+    public static function registration_callback_url() {
+        $url = self::callback_url();
+
+        if (self::signing_secret() !== '') {
+            return $url;
+        }
+
+        $shared = (string) get_option('sp_webhook_secret', '');
+        if ($shared === '') {
+            return $url;
+        }
+
+        return add_query_arg('secret', $shared, $url);
     }
 
     private static function credentials() {

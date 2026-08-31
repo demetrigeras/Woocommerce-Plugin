@@ -73,10 +73,37 @@ class SP_Webhook_Handler {
      */
     public function test_webhook_endpoint($request) {
         error_log('🧪 PP Webhook - Test endpoint accessed');
+
+        // Reports whether a delivery could be AUTHENTICATED, which is the usual
+        // reason payments stop landing: the endpoint is reachable, deliveries
+        // arrive, and every one is rejected 401 because nothing here can verify
+        // them. Booleans only - no secret or key value is ever returned.
+        $has_signing_secret = class_exists('SP_Webhook_Provisioner')
+            && SP_Webhook_Provisioner::signing_secret() !== '';
+        $webhook_id = class_exists('SP_Webhook_Provisioner') ? SP_Webhook_Provisioner::webhook_id() : 0;
+        $has_shared_secret = get_option('sp_webhook_secret', '') !== '';
+
+        if ($has_signing_secret) {
+            $accepts = 'signed deliveries (X-Webhook-Signature)';
+        } elseif ($has_shared_secret) {
+            $accepts = 'deliveries carrying ?secret= (no signing secret issued yet)';
+        } else {
+            $accepts = 'any delivery - nothing is configured to verify against';
+        }
+
         return new WP_REST_Response(array(
-            'status' => 'success',
-            'message' => 'Stablecoin Pay webhook endpoint is working!',
-            'endpoint' => rest_url(SP_Webhook_Provisioner::CALLBACK_ROUTE),
+            'status'    => 'success',
+            'message'   => 'Webhook endpoint is reachable.',
+            'endpoint'  => rest_url(SP_Webhook_Provisioner::CALLBACK_ROUTE),
+            'namespaces_served' => class_exists('SP_Webhook_Provisioner')
+                ? SP_Webhook_Provisioner::all_namespaces()
+                : array(),
+            'verification' => array(
+                'accepts'             => $accepts,
+                'has_signing_secret'  => $has_signing_secret,
+                'has_shared_secret'   => $has_shared_secret,
+                'registered_webhook_id' => $webhook_id,
+            ),
             'timestamp' => current_time('mysql')
         ), 200);
     }

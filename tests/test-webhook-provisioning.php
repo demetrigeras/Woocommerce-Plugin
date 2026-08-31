@@ -26,6 +26,7 @@ function get_transient($k)                     { return $GLOBALS['transients'][$
 function set_transient($k, $v, $t = 0)         { $GLOBALS['transients'][$k] = $v; return true; }
 function apply_filters($tag, $value)           { return $value; }
 function wp_json_encode($d)                    { return json_encode($d); }
+function add_query_arg($k,$v,$u){ return $u . (strpos($u,'?')===false?'?':'&') . $k . '=' . rawurlencode($v); }
 function wp_parse_url($u)                      { return parse_url($u); }
 function esc_html($s)                          { return htmlspecialchars((string) $s, ENT_QUOTES); }
 function sanitize_text_field($s)               { return trim(strip_tags((string) $s)); }
@@ -957,6 +958,58 @@ $safe = new ReflectionMethod('SP_Webhook_Handler', 'safe_log_payload');
 $safe->setAccessible(true);
 check('redaction helper returns something usable', $safe->invoke(null, array('a' => 1)) !== null);
 check('redaction helper handles a scalar', $safe->invoke(null, 'x') !== null);
+
+
+
+// ================ 17. Registered URL must always be verifiable on arrival
+section('17. The registered URL carries something we can actually verify');
+
+reset_state();
+$GLOBALS['options']['sp_webhook_secret'] = 'shared_abc';
+
+// No signing secret yet: a bare URL would make every delivery unverifiable (401),
+// so the shared secret has to ride along exactly as it did before provisioning.
+check('display URL stays clean',
+    strpos(SP_Webhook_Provisioner::callback_url(), 'secret=') === false,
+    SP_Webhook_Provisioner::callback_url());
+$reg = SP_Webhook_Provisioner::registration_callback_url();
+check('registered URL carries the shared secret while unsigned',
+    strpos($reg, 'secret=shared_abc') !== false, $reg);
+check('  -> and still points at the canonical route',
+    strpos($reg, 'woowh/v1/webhook') !== false, $reg);
+
+// Once a signing secret exists, signatures are used and the credential leaves the URL.
+$GLOBALS['options']['sp_webhook_signing_secret'] = 'whsec_live';
+$reg = SP_Webhook_Provisioner::registration_callback_url();
+check('registered URL drops the secret once signing is available',
+    strpos($reg, 'secret=') === false, $reg);
+
+// Nothing configured at all: nothing to append.
+reset_state();
+check('no shared secret -> plain URL',
+    strpos(SP_Webhook_Provisioner::registration_callback_url(), 'secret=') === false);
+
+// Matching must still recognise our own webhook despite the query string.
+reset_state();
+$GLOBALS['options']['sp_webhook_secret'] = 'shared_abc';
+$GLOBALS['api'] = function ($method, $url) {
+    if ($method === 'GET') {
+        return json_reply(200, array('webhooks' => array(array(
+            'webhook_id' => 950,
+            'url' => 'https://shop.example.com/wp-json/woowh/v1/webhook?secret=shared_abc',
+            'status' => 'active',
+        ))));
+    }
+    if (str_ends_with($url, '/rotate-secret')) { return json_reply(200, array('signing_secret' => 'whsec_r')); }
+    return json_reply(500, array('message' => 'MUST NOT CREATE A DUPLICATE'));
+};
+$r = SP_Webhook_Provisioner::sync();
+$creates = array_filter($GLOBALS['http_log'], function ($c) {
+    return $c['method'] === 'POST' && !str_ends_with($c['url'], '/rotate-secret');
+});
+check('a secret-bearing registered URL is still matched as ours',
+    ($r['state'] ?? '') === 'ok' && count($creates) === 0, json_encode($r));
+check('  -> adopted, not duplicated', SP_Webhook_Provisioner::webhook_id() === 950);
 
 
 echo "\n" . str_repeat('=', 62) . "\n";
