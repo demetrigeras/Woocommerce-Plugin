@@ -503,7 +503,9 @@ class WC_Gateway_SP extends WC_Payment_Gateway {
         $api_base_url = $this->get_api_base_url();
         
         error_log('PP Whitelabel: 📝 Settings - Merchant ID: ' . (empty($merchant_id) ? 'EMPTY' : substr($merchant_id, 0, 20) . '...'));
-        error_log('PP Whitelabel: 📝 Settings - API Key: ' . (strlen($api_key) > 0 ? substr($api_key, 0, 10) . '...' : 'EMPTY'));
+        // Never log any part of the key, nor its length: debug.log is world-readable
+        // on plenty of hosts, and a prefix is enough to identify or brute-force a key.
+        error_log('PP Whitelabel: 📝 Settings - API Key: ' . ($api_key !== '' ? 'SET' : 'EMPTY'));
         error_log('PP Whitelabel: 📝 Settings - API Base URL: ' . $api_base_url);
         error_log('═══════════════════════════════════════════════════════════');
         
@@ -547,7 +549,7 @@ class WC_Gateway_SP extends WC_Payment_Gateway {
         
         if (isset($_POST['woocommerce_sp_api_key'])) {
             $api_key_length = strlen($_POST['woocommerce_sp_api_key']);
-            error_log('PP Whitelabel: 📝 POST api_key: ' . ($api_key_length > 0 ? substr($_POST['woocommerce_sp_api_key'], 0, 10) . '... (length: ' . $api_key_length . ')' : 'EMPTY'));
+            error_log('PP Whitelabel: 📝 POST api_key: ' . ($api_key_length > 0 ? 'SET' : 'EMPTY'));
         } else {
             error_log('PP Whitelabel: ⚠️ POST api_key NOT SET - This is normal for password fields if unchanged');
         }
@@ -571,7 +573,7 @@ class WC_Gateway_SP extends WC_Payment_Gateway {
         $saved_merchant_id = $this->get_option('merchant_id', '');
         $saved_api_key = $this->get_option('api_key', '');
         error_log('PP Whitelabel: ✅ Saved merchant_id: ' . (empty($saved_merchant_id) ? 'EMPTY' : substr($saved_merchant_id, 0, 20) . '... (length: ' . strlen($saved_merchant_id) . ')'));
-        error_log('PP Whitelabel: ✅ Saved api_key: ' . (empty($saved_api_key) ? 'EMPTY' : substr($saved_api_key, 0, 10) . '... (length: ' . strlen($saved_api_key) . ')'));
+        error_log('PP Whitelabel: ✅ Saved api_key: ' . (empty($saved_api_key) ? 'EMPTY' : 'SET'));
         error_log('═══════════════════════════════════════════════════════════');
         
         // Now fetch branding (if we have credentials)
@@ -902,6 +904,32 @@ class WC_Gateway_SP extends WC_Payment_Gateway {
     // REMOVED: prepare_order_data - using WooCommerce-only approach
     
     /**
+     * Provenance attached to every purchase session.
+     *
+     * Lets a session be traced back to the integration and the store that created
+     * it, which is otherwise guesswork once sessions from many merchants and
+     * several platforms are in the same table.
+     *
+     * Deliberately contains no customer data - this travels on every session and
+     * is kept to facts about the installation.
+     *
+     * @return array
+     */
+    private function get_source_metadata() {
+        $site_url = home_url();
+
+        return array(
+            'source'              => 'woocommerce_plugin',
+            'source_platform'     => 'woocommerce',
+            'site_url'            => $site_url,
+            'site_domain'         => wp_parse_url($site_url, PHP_URL_HOST),
+            'plugin_version'      => defined('SP_VERSION') ? SP_VERSION : '',
+            'woocommerce_version' => defined('WC_VERSION') ? WC_VERSION : '',
+            'wordpress_version'   => get_bloginfo('version'),
+        );
+    }
+
+    /**
      * Prepare purchase session data
      */
     private function prepare_purchase_session_data($order, $sp_order) {
@@ -990,7 +1018,7 @@ class WC_Gateway_SP extends WC_Payment_Gateway {
             'currency' => $order->get_currency(),
             'amount' => $total_amount,
             'recurring' => $is_subscription,
-            'metadata' => array(
+            'metadata' => array_merge($this->get_source_metadata(), array(
                 'payment_gateway' => 'stablecoin_pay', // Identifier for data/analytics purposes
                 'payment_type' => 'stablecoin_pay', // Payment type identifier
                 'woocommerce_order_id' => $order->get_id(),
@@ -1043,7 +1071,7 @@ class WC_Gateway_SP extends WC_Payment_Gateway {
                     'postcode' => $order->get_shipping_postcode(),
                     'country' => $order->get_shipping_country()
                 )
-            ),
+            )),
             'success_url' => $this->get_return_url($order), // Return to order received page after payment
             'cancel_url' => $this->get_return_url($order), // Return to order received page if cancelled
             'failure_url' => $this->get_return_url($order) // Return to order received page if failed
@@ -2941,7 +2969,7 @@ class WC_Gateway_SP extends WC_Payment_Gateway {
             'currency' => $cart_data['currency'],
             'amount' => $cart_data['total'],
             'recurring' => $cart_data['has_subscription'],
-            'metadata' => array(
+            'metadata' => array_merge($this->get_source_metadata(), array(
                 'payment_gateway' => 'stablecoin_pay', // Identifier for data/analytics purposes
                 'payment_type' => 'stablecoin_pay', // Payment type identifier
                 'woocommerce_order_id' => $order->get_id(),
@@ -2976,7 +3004,7 @@ class WC_Gateway_SP extends WC_Payment_Gateway {
                     'postcode' => $order->get_shipping_postcode(),
                     'country' => $order->get_shipping_country()
                 )
-            ),
+            )),
             'success_url' => $success_url,
             'cancel_url' => $cancel_url,
             'failure_url' => $failure_url

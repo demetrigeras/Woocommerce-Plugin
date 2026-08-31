@@ -97,7 +97,7 @@ class SP_API_Client {
             }
         }
         
-        error_log('PP API - Full Payload: ' . json_encode($payload));
+        error_log('PP API - Payload: ' . json_encode(self::redact_for_log($payload)));
         error_log('PP API - Success URL: ' . ($payload['success_url'] ?? 'NOT SET'));
       
         $headers = array(
@@ -408,6 +408,59 @@ class SP_API_Client {
             || strpos($haystack, 'signing limit') !== false
             || strpos($haystack, 'awaiting signature') !== false
             || strpos($haystack, 'needs to be signed') !== false;
+    }
+
+    /**
+     * Copy of a payload with personal data masked, for logging.
+     *
+     * The plugin logs payloads to diagnose checkout problems, and those payloads
+     * carry customer names, emails, phone numbers, postal addresses and wallet
+     * addresses. debug.log is world-readable on many hosts, so writing that out
+     * verbatim turns a debugging aid into a data leak. Amounts, ids, counts and
+     * currencies survive - they are what the logs are actually read for.
+     *
+     * @param mixed $data
+     * @param int   $depth
+     * @return mixed Safe to pass to json_encode() and log.
+     */
+    public static function redact_for_log($data, $depth = 0) {
+        if ($depth > 6 || !is_array($data)) {
+            return $data;
+        }
+
+        // Substring match, so billing_email / shipping_first_name / customer_wallet
+        // are all covered without enumerating every prefix Woo uses.
+        $sensitive = array(
+            'email', 'phone', 'name', 'address', 'street', 'city', 'postcode',
+            'postal', 'zip', 'state', 'province', 'country', 'company',
+            'wallet', 'signing_address', 'to_address', 'from_address',
+            'ip', 'user_agent', 'customer',
+        );
+
+        $out = array();
+        foreach ($data as $key => $value) {
+            $key_l = strtolower((string) $key);
+
+            $is_sensitive = false;
+            foreach ($sensitive as $needle) {
+                if (strpos($key_l, $needle) !== false) {
+                    $is_sensitive = true;
+                    break;
+                }
+            }
+
+            if ($is_sensitive) {
+                // Keep the shape (present / absent) without the value.
+                $out[$key] = is_array($value)
+                    ? '[redacted array(' . count($value) . ')]'
+                    : (($value === null || $value === '') ? '[empty]' : '[redacted]');
+                continue;
+            }
+
+            $out[$key] = is_array($value) ? self::redact_for_log($value, $depth + 1) : $value;
+        }
+
+        return $out;
     }
 
     /**

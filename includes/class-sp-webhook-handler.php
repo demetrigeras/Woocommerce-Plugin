@@ -119,14 +119,14 @@ class SP_Webhook_Handler {
             return new WP_REST_Response(array('error' => 'Invalid JSON data'), 400);
         }
 
-        error_log('🔔 PP Webhook - Data: ' . json_encode($data));
+        error_log('🔔 PP Webhook - Data: ' . json_encode(SP_API_Client::redact_for_log($data)));
 
         // Log specific data structures for debugging
         if (isset($data['agreement'])) {
-            error_log('🔔 PP Webhook - Agreement data: ' . json_encode($data['agreement']));
+            error_log('🔔 PP Webhook - Agreement data: ' . json_encode(SP_API_Client::redact_for_log($data['agreement'])));
         }
         if (isset($data['transaction_details'])) {
-            error_log('🔔 PP Webhook - Transaction details: ' . json_encode($data['transaction_details']));
+            error_log('🔔 PP Webhook - Transaction details: ' . json_encode(SP_API_Client::redact_for_log($data['transaction_details'])));
         }
 
         // Process the webhook
@@ -141,7 +141,7 @@ class SP_Webhook_Handler {
      * Process webhook data
      */
     private function process_webhook($data) {
-        error_log('PP Webhook: Full payload: ' . json_encode($data));
+        error_log('PP Webhook: Payload: ' . json_encode(SP_API_Client::redact_for_log($data)));
         
         $event_type = $data['type'] ?? 'unknown';
         $origin_id = $data['origin_id'] ?? null;
