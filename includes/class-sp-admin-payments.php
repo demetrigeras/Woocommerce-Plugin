@@ -278,36 +278,89 @@ class SP_Admin_Payments {
             $customer_name = '';
             $customer_email = '';
             
-            // Try to match by order ID in payment metadata
-            if (isset($payment['metadata']) && isset($payment['metadata']['woocommerce_order_id'])) {
-                $order_id = absint($payment['metadata']['woocommerce_order_id']);
+            // Try to match by order ID in payment metadata.
+            // Metadata sometimes arrives JSON-encoded rather than as an object.
+            $meta = isset($payment['metadata']) ? $payment['metadata'] : null;
+            if (is_string($meta)) {
+                $decoded = json_decode($meta, true);
+                $meta = is_array($decoded) ? $decoded : null;
+            }
+            if (is_array($meta) && !empty($meta['woocommerce_order_id'])) {
+                $order_id = absint($meta['woocommerce_order_id']);
                 $order = wc_get_order($order_id);
             }
-            
-            // Try to match by purchase session ID
-            if (!$order && isset($payment['purchase_session_id'])) {
-                $orders = wc_get_orders(array(
-                    'meta_key' => '_sp_purchase_session_id',
-                    'meta_value' => $payment['purchase_session_id'],
-                    'limit' => 1
-                ));
-                
-                if (!empty($orders)) {
-                    $order = $orders[0];
+
+            // Try to match by purchase session ID.
+            //
+            // The platform is not consistent about this field's name: webhooks call
+            // it `origin_id`, the session API calls it `purchase_session_id`. Only
+            // checking one of them silently leaves every payment unmatched, which
+            // shows up as a blank Order and Customer column even though the order
+            // exists.
+            if (!$order) {
+                $session_id = '';
+                foreach (array('purchase_session_id', 'origin_id', 'session_id', 'purchaseSessionId', 'originId') as $key) {
+                    if (!empty($payment[$key]) && is_string($payment[$key])) {
+                        $session_id = $payment[$key];
+                        break;
+                    }
+                    if (is_array($meta) && !empty($meta[$key]) && is_string($meta[$key])) {
+                        $session_id = $meta[$key];
+                        break;
+                    }
+                }
+
+                if ($session_id !== '') {
+                    // Sessions are sometimes prefixed on the wire but stored bare.
+                    $candidates = array($session_id);
+                    if (strpos($session_id, 'sess_') === 0) {
+                        $candidates[] = substr($session_id, 5);
+                    }
+
+                    foreach ($candidates as $candidate) {
+                        $orders = wc_get_orders(array(
+                            'meta_key' => '_sp_purchase_session_id',
+                            'meta_value' => $candidate,
+                            'limit' => 1
+                        ));
+                        if (!empty($orders)) {
+                            $order = $orders[0];
+                            break;
+                        }
+                    }
                 }
             }
-            
-            // Try to match by payment ID stored in order meta
-            if (!$order && isset($payment['payment_id'])) {
-                $orders = wc_get_orders(array(
-                    'meta_key' => '_sp_payment_id',
-                    'meta_value' => $payment['payment_id'],
-                    'limit' => 1
-                ));
-                
-                if (!empty($orders)) {
-                    $order = $orders[0];
+
+            // Try to match by payment ID stored in order meta. Note this only helps
+            // once a webhook has been processed - that is what writes _sp_payment_id.
+            if (!$order) {
+                $payment_id = '';
+                foreach (array('payment_id', 'id', 'paymentId') as $key) {
+                    if (!empty($payment[$key]) && (is_string($payment[$key]) || is_int($payment[$key]))) {
+                        $payment_id = (string) $payment[$key];
+                        break;
+                    }
                 }
+
+                if ($payment_id !== '') {
+                    $orders = wc_get_orders(array(
+                        'meta_key' => '_sp_payment_id',
+                        'meta_value' => $payment_id,
+                        'limit' => 1
+                    ));
+
+                    if (!empty($orders)) {
+                        $order = $orders[0];
+                    }
+                }
+            }
+
+            // Nothing matched. Log the record's shape (values withheld) so the
+            // field names the platform actually sends can be read off the log
+            // instead of guessed at.
+            if (!$order && class_exists('SP_API_Client')) {
+                error_log('PP - Payments: no order matched this payment. Record shape: '
+                    . SP_API_Client::describe_shape($payment));
             }
             
             // Get customer info
