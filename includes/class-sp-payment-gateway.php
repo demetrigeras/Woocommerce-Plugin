@@ -1661,18 +1661,18 @@ class WC_Gateway_SP extends WC_Payment_Gateway {
                 ) . '<br><br>';
                 $insufficient_funds_note .= $this->get_dashboard_limit_instruction() . '<br><br>';
                 
-                $insufficient_funds_note .= '<strong>To add funds:</strong><br>';
+                // Funding happens in the merchant dashboard, not here - this plugin
+                // does not onramp.
                 $settings_label = $this->get_title();
-                $insufficient_funds_note .= '1. Go to <strong>WooCommerce → Settings → Payments</strong> (' . esc_html($settings_label) . ')<br>';
-                $insufficient_funds_note .= '2. Click <strong>"Manage"</strong> or scroll down<br>';
-                $insufficient_funds_note .= '3. Click the <strong>"Onramp USDC Polygon via Meld"</strong> button<br>';
-                $insufficient_funds_note .= '4. Complete the onramp process<br>';
-                $insufficient_funds_note .= '5. Retry the refund once funds are available<br><br>';
-                
-                $insufficient_funds_note .= '<a href="' . esc_url($sp_settings_url) . '" class="button button-primary" style="background: #0284c7; border-color: #0284c7;">Go to ' . esc_html($settings_label) . ' Settings</a>';
+                $insufficient_funds_note .= '<strong>' . esc_html__('To add funds:', 'stablecoin-pay') . '</strong><br>';
+                $insufficient_funds_note .= '1. ' . esc_html__('Top up your merchant wallet from your dashboard.', 'stablecoin-pay') . '<br>';
+                $insufficient_funds_note .= '2. ' . esc_html__('Retry the refund once the balance has cleared.', 'stablecoin-pay') . '<br><br>';
+
+                $insufficient_funds_note .= '<a href="' . esc_url($sp_settings_url) . '" class="button button-primary" style="background: #0284c7; border-color: #0284c7;">'
+                    . sprintf(esc_html__('Go to %s settings', 'stablecoin-pay'), esc_html($settings_label)) . '</a>';
                 
                 $order->add_order_note($insufficient_funds_note);
-                $order->update_status('refund-pending', __('Refund pending - insufficient funds. Please add USDC to Polygon wallet.', 'stablecoin-pay'));
+                $order->update_status('refund-pending', __('Refund pending - insufficient funds. Top up your merchant wallet and retry.', 'stablecoin-pay'));
                 
                 error_log('PP Refund: Insufficient funds: ' . $error_message);
                 return new WP_Error('insufficient_funds', $error_message);
@@ -1825,75 +1825,7 @@ class WC_Gateway_SP extends WC_Payment_Gateway {
         return true;
     }
     
-    /**
-     * Generate Meld onramp URL for USDC Polygon
-     * Format: https://meldcrypto.com/?publicKey=...&destinationCurrencyCodeLocked=USDC_POLYGON&walletAddressLocked=...&transactionType=BUY&sourceAmount=...&externalSessionId=...&redirectUrl=...
-     */
-    private function get_meld_onramp_url($wallet_address = '', $amount = '') {
-        // Meld base URL
-        $meld_base_url = 'https://meldcrypto.com';
-        
-        // Get Meld public key from settings (if configured)
-        // For now, we'll use a placeholder - you may want to add this as a setting field
-        $gateway_settings = get_option('woocommerce_sp_settings', array());
-        $meld_public_key = isset($gateway_settings['meld_public_key']) ? $gateway_settings['meld_public_key'] : '';
-        
-
-        if (empty($wallet_address)) {
-           
-        }
-        
-        // Generate session ID (UUID v4 format)
-        $session_id = $this->generate_uuid4();
-        
-        // Get redirect URL (WordPress admin - Stablecoin Pay settings page)
-        $redirect_url = admin_url('admin.php?page=wc-settings&tab=checkout&section=sp');
-        
-        // Build URL parameters
-        $url_params = array();
-        
-        // Required/Main parameters
-        $url_params['destinationCurrencyCodeLocked'] = 'USDC_POLYGON';
-        $url_params['transactionType'] = 'BUY';
-        $url_params['externalSessionId'] = $session_id;
-        $url_params['redirectUrl'] = $redirect_url; // http_build_query will encode it automatically
-        
-        // Optional parameters
-        if (!empty($meld_public_key)) {
-            $url_params['publicKey'] = $meld_public_key;
-        }
-        if (!empty($wallet_address)) {
-            $url_params['walletAddressLocked'] = $wallet_address;
-        }
-        if (!empty($amount)) {
-            $url_params['sourceAmount'] = $amount;
-        }
-        
-        // Build final URL
-        $final_url = $meld_base_url . '/?' . http_build_query($url_params);
-        
-        return $final_url;
-    }
-    
-    /**
-     * Generate UUID v4
-     */
-    private function generate_uuid4() {
-        // Generate UUID v4 format: xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx
-        $data = random_bytes(16);
-        $data[6] = chr(ord($data[6]) & 0x0f | 0x40); // Set version to 0100
-        $data[8] = chr(ord($data[8]) & 0x3f | 0x80); // Set bits 6-7 to 10
-        
-        return sprintf('%08s-%04s-%04s-%04s-%12s',
-            bin2hex(substr($data, 0, 4)),
-            bin2hex(substr($data, 4, 2)),
-            bin2hex(substr($data, 6, 2)),
-            bin2hex(substr($data, 8, 2)),
-            bin2hex(substr($data, 10, 6))
-        );
-    }
-    
-    /**
+/**
      * Get token symbol for currency
      */
     private function get_token_symbol_for_currency($currency) {
@@ -2179,7 +2111,6 @@ class WC_Gateway_SP extends WC_Payment_Gateway {
     public function get_setup_instructions_html() {
         $dashboard_url = $this->get_dashboard_url_from_config();
         $plugin_name = class_exists('SP_Whitelabel_Branding') ? SP_Whitelabel_Branding::get_whitelabel_plugin_name_from_config() : null;
-        $meld_url = $this->get_meld_onramp_url();
         $setup_video_url = $this->get_setup_video_url_from_config();
 
         $step1_title = $plugin_name
@@ -2291,6 +2222,23 @@ class WC_Gateway_SP extends WC_Payment_Gateway {
             <li><?php esc_html_e('Done! Customers will now see the payment option at checkout!', 'stablecoin-pay'); ?></li>
         </ol>
         <p style="margin-bottom:0;padding:10px;background:#fef3c7;border-radius:4px;border:1px solid #998843"><?php echo $important_phrase; ?></p>
+        <?php // Refunds move real funds on-chain, so they carry costs a card refund
+              // does not. Merchants should know this before they issue one, not
+              // after they see the customer received less than they paid. ?>
+        <div style="margin-top:20px;padding:15px;background:#f0f6fc;border-radius:4px;border:1px solid #6b8cae">
+            <h3 style="margin-top:0">↩️ <?php esc_html_e('A quick note on refunds', 'stablecoin-pay'); ?></h3>
+            <p style="margin-top:0"><?php esc_html_e('You can refund an order from here, and it will be sent back on-chain. Because it is a real blockchain transfer, two small costs come with it:', 'stablecoin-pay'); ?></p>
+            <ul style="line-height:1.6;margin:10px 0">
+                <li><?php echo sprintf(
+                    /* translators: %s: gas headroom amount, e.g. 0.1 */
+                    __('A <strong>network fee of roughly %s</strong> to move the funds. This is paid to the network, not to us, and it is not returned to the customer.', 'stablecoin-pay'),
+                    esc_html((string) $this->get_refund_gas_headroom())
+                ); ?></li>
+                <li><?php esc_html_e('Your usual merchant fee, which applies to the transfer that sends the money back.', 'stablecoin-pay'); ?></li>
+            </ul>
+            <p style="margin-bottom:0"><strong><?php esc_html_e('So where you have the choice, refunding by card or cash is usually the kinder option', 'stablecoin-pay'); ?></strong> &mdash;
+            <?php esc_html_e('the customer gets the full amount back and it costs you nothing to send. On-chain refunds are here for when that is not practical.', 'stablecoin-pay'); ?></p>
+        </div>
         <div style="margin-top:20px;padding:15px;background:#e8f5e9;border-radius:4px;border:1px solid #4caf50">
             <h3 style="margin-top:0">💳 <?php esc_html_e('Setting Up Subscription Products', 'stablecoin-pay'); ?></h3>
             <p><strong><?php esc_html_e('To enable recurring payments for a product:', 'stablecoin-pay'); ?></strong></p>

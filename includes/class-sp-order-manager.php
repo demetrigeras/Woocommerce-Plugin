@@ -32,6 +32,13 @@ class SP_Order_Manager {
         add_action('woocommerce_order_status_changed', array($this, 'handle_order_status_change'), 10, 3);
         add_action('wp_ajax_sp_admin_cancel_subscription', array($this, 'ajax_admin_cancel_subscription'));
 
+        // WooCommerce emails print the payment method title that was stored on the
+        // order at checkout. That value is a snapshot, so any order placed before a
+        // rebrand keeps naming the old provider - in customer-facing email, long
+        // after the plugin itself was white-labelled. Resolve it at render time so
+        // every order, past and present, shows the current partner name.
+        add_filter('woocommerce_order_get_payment_method_title', array($this, 'whitelabel_payment_method_title'), 10, 2);
+
         add_action('woocommerce_admin_order_data_after_billing_address', array($this, 'display_subscription_status'));
         add_action('woocommerce_admin_order_data_after_shipping_address', array($this, 'display_subscription_status'));
 
@@ -592,6 +599,51 @@ class SP_Order_Manager {
         return isset($map[$id]) ? $map[$id] : '';
     }
     
+    /**
+     * Render this gateway's payment method title using the current partner name.
+     *
+     * Applies to orders paid through this plugin only - including ones recorded
+     * under the pre-rename gateway id, since those are exactly the orders most
+     * likely to be carrying a stale provider name.
+     *
+     * @param string   $title Stored title.
+     * @param WC_Order $order
+     * @return string
+     */
+    public function whitelabel_payment_method_title($title, $order) {
+        if (!$order instanceof WC_Order) {
+            return $title;
+        }
+
+        $method = $order->get_payment_method();
+        if ($method !== 'sp' && $method !== 'coinsub') {
+            return $title;
+        }
+
+        return self::get_whitelabel_method_title();
+    }
+
+    /**
+     * "Pay with {partner}", from the whitelabel config.
+     *
+     * Falls back to the plugin's own name rather than to whatever was stored,
+     * because a stored value is the thing we are trying to stop displaying.
+     *
+     * @return string
+     */
+    public static function get_whitelabel_method_title() {
+        $name = class_exists('SP_Whitelabel_Branding')
+            ? SP_Whitelabel_Branding::get_whitelabel_plugin_name_from_config()
+            : null;
+
+        if (!empty($name)) {
+            /* translators: %s: payment provider name */
+            return sprintf(__('Pay with %s', 'stablecoin-pay'), $name);
+        }
+
+        return __('Pay with Stablecoin Pay', 'stablecoin-pay');
+    }
+
     /**
      * Add Stablecoin Pay information to order emails
      */
