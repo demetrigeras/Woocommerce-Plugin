@@ -72,6 +72,7 @@ function sp_commerce_init() {
     }
 
     // Include required files
+    require_once SP_PLUGIN_DIR . 'includes/sp-checkout-url.php';
     require_once SP_PLUGIN_DIR . 'includes/class-sp-api-client.php';
     require_once SP_PLUGIN_DIR . 'includes/class-sp-whitelabel-branding.php';
     require_once SP_PLUGIN_DIR . 'includes/class-sp-payment-gateway.php';
@@ -439,7 +440,7 @@ function sp_checkout_page_preconnect() {
         
         // Try session first (if WooCommerce is initialized)
         if (function_exists('WC') && WC()->session) {
-            $checkout_url = WC()->session->get('sp_checkout_url_' . $order_id);
+            $checkout_url = sp_normalize_checkout_url(WC()->session->get('sp_checkout_url_' . $order_id));
             if (!empty($checkout_url)) {
                 error_log('🔗 PP Checkout Page: Checkout URL from session for order #' . $order_id . ': ' . $checkout_url);
             }
@@ -530,7 +531,7 @@ function sp_checkout_page_shortcode($atts) {
     if (empty($checkout_url) && isset($_GET['checkout_url'])) {
         // URL decode the checkout URL if it's encoded
         $raw_url = $_GET['checkout_url'];
-        $checkout_url = esc_url_raw(urldecode($raw_url));
+        $checkout_url = sp_normalize_checkout_url(esc_url_raw(urldecode($raw_url)));
         error_log('✅ PP Checkout Page: Using checkout URL from query parameter: ' . $checkout_url);
     }
     
@@ -1487,7 +1488,7 @@ function sp_ajax_process_payment() {
     error_log('PP AJAX: Order #' . $order_id . ' built. Subtotal $' . $order->get_subtotal() . ' + shipping $' . $order->get_shipping_total() . ' + tax $' . $order->get_total_tax() . ' = total $' . $order->get_total());
     
     // If this order already has a checkout URL (rare race), reuse it
-    $existing_checkout = $order->get_meta('_sp_checkout_url');
+    $existing_checkout = sp_normalize_checkout_url($order->get_meta('_sp_checkout_url'));
     if (!empty($existing_checkout)) {
         error_log('🔗 PP AJAX: Found existing checkout URL: ' . $existing_checkout);
         // Store checkout URL in session to avoid long URLs

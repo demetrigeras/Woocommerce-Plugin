@@ -954,50 +954,7 @@ class WC_Gateway_SP extends WC_Payment_Gateway {
      *
      * @return array
      */
-    /**
-     * Reshape a name so the checkout's prefill validation will accept it.
-     *
-     * The server validates first/last name against ^[\p{L} ]+$ - Unicode letters
-     * and spaces only - which rejects perfectly ordinary names: "Mary-Jane",
-     * "O'Brien", "J.R.". Sending those verbatim just gets them discarded and the
-     * buyer is asked to type their details again.
-     *
-     * So names are normalised to fit rather than dropped. An approximate name on
-     * a pre-registered account is an acceptable trade for skipping the step;
-     * the email, which actually identifies the buyer, is never altered.
-     *
-     *   Mary-Jane -> Mary Jane      (separator becomes a space, still readable)
-     *   O'Brien   -> OBrien         (apostrophe dropped, the usual transliteration)
-     *   J.R.      -> JR
-     *   Jane2     -> Jane
-     *
-     * @param string $name
-     * @return string Empty when nothing usable survives.
-     */
-    private function sanitize_prefill_name($name) {
-        // Hyphens and underscores join words - a space keeps the name readable.
-        $name = preg_replace('/[-_]+/u', ' ', $name);
-
-        // Drop everything the server will not accept: apostrophes, periods,
-        // digits, punctuation, symbols. The /u modifier is required for \p{L}
-        // to mean "any Unicode letter" rather than just ASCII.
-        $name = preg_replace('/[^\p{L} ]+/u', '', $name);
-
-        // Collapse the gaps left behind.
-        return trim(preg_replace('/\s+/u', ' ', (string) $name));
-    }
-
-    /**
-     * Whether a name matches the checkout's prefill validation.
-     *
-     * @param string $name
-     * @return bool
-     */
-    private function is_prefillable_name($name) {
-        return (bool) preg_match('/^[\p{L} ]+$/u', $name);
-    }
-
-    /**
+/**
      * The environment a host belongs to, ignoring its subdomain.
      *
      *   api.coinsub.io      -> coinsub.io
@@ -1052,165 +1009,39 @@ class WC_Gateway_SP extends WC_Payment_Gateway {
      * @return string
      */
     private function normalize_checkout_url($url) {
-        if (!is_string($url) || $url === '') {
-            return $url;
+        // Shared with the AJAX handler and the iframe page - see
+        // includes/sp-checkout-url.php. One implementation, applied everywhere a
+        // checkout URL is used rather than only where it is created.
+        if (function_exists('sp_normalize_checkout_url')) {
+            return sp_normalize_checkout_url($url);
         }
-
-        $parts = wp_parse_url($url);
-        if (!$parts || empty($parts['scheme']) || empty($parts['host']) || empty($parts['path'])) {
-            return $url;
-        }
-
-        // Already correct.
-        if (strpos($parts['path'], '/checkout/') !== false) {
-            return $url;
-        }
-
-        $segments = array_values(array_filter(explode('/', $parts['path']), 'strlen'));
-        if (count($segments) !== 1) {
-            return $url;
-        }
-
-        $code = $segments[0];
-        if (!preg_match('/^[A-Za-z0-9][A-Za-z0-9_-]{5,63}$/', $code)) {
-            return $url;
-        }
-
-        $rebuilt = $parts['scheme'] . '://' . $parts['host']
-            . (isset($parts['port']) ? ':' . $parts['port'] : '')
-            . '/checkout/' . $code
-            . (isset($parts['query']) ? '?' . $parts['query'] : '')
-            . (isset($parts['fragment']) ? '#' . $parts['fragment'] : '');
-
-        error_log('PP Gateway: ⚠️ checkout URL was missing the /checkout/ prefix - repaired '
-            . $url . ' -> ' . $rebuilt
-            . ' (the bare /{code} route is the subscription-product route and 404s). '
-            . 'This came from the API response unmodified; worth reporting upstream.');
-
-        return apply_filters('sp_normalized_checkout_url', $rebuilt, $url);
+        return $url;
     }
 
     /**
-     * The WordPress account an order belongs to, if any.
+     * The `details` line sent with a purchase session.
      *
-     * Guest checkouts have no account, so this returns false and the caller sends
-     * only what the billing form actually collected.
+     * REQUIRED by the API - an empty or missing value is rejected with "Invalid
+     * request payload" and checkout never starts, so this can never be blank.
      *
-     * @param WC_Order $order
-     * @return WP_User|false
-     */
-    private function get_order_account($order) {
-        $user_id = (int) $order->get_customer_id();
-        if ($user_id <= 0) {
-            return false;
-        }
-
-        $user = get_user_by('id', $user_id);
-        return $user ? $user : false;
-    }
-
-    /**
-     * Buyer details that let hosted checkout skip its personal-information step.
-     *
-     * When `email`, `firstName` and `lastName` are all present in metadata the
-     * buyer is pre-registered and the form is skipped, so a customer who already
-     * typed these at WooCommerce checkout does not type them again.
-     *
-     * Each field is sent only when non-empty. A missing or invalid one just leaves
-     * the step in the flow, but an empty string could read as invalid - which is
-     * worse than omitting it.
+     * It is rendered to the payer directly under the order name, so it is kept to
+     * a bare order reference: no product breakdown, no shipping/tax lines, no
+     * description. Filterable, but an empty return falls back to the default
+     * rather than breaking checkout.
      *
      * @param WC_Order $order
-     * @return array Empty when the order has nothing usable.
+     * @return string Never empty.
      */
-    private function get_buyer_prefill_metadata($order) {
-        $prefill = array();
+    private function get_purchase_session_details($order) {
+        $default = sprintf(
+            /* translators: %s: WooCommerce order number */
+            __('Order #%s', 'stablecoin-pay'),
+            $order->get_order_number()
+        );
 
-        $email = trim((string) $order->get_billing_email());
-        $first = trim((string) $order->get_billing_first_name());
-        $last  = trim((string) $order->get_billing_last_name());
+        $details = (string) apply_filters('sp_purchase_session_details', $default, $order);
 
-        // Billing fields win. When the checkout form did not collect a name -
-        // some stores trim those fields down - fall back to the WordPress account
-        // behind the order. Guest orders have no account, so nothing is invented.
-        if ($first === '' || $last === '' || $email === '') {
-            $user = $this->get_order_account($order);
-
-            if ($user) {
-                if ($first === '') {
-                    $first = trim((string) $user->first_name);
-                }
-                if ($last === '') {
-                    $last = trim((string) $user->last_name);
-                }
-                if ($email === '') {
-                    $email = trim((string) $user->user_email);
-                }
-
-                // Last resort: the account's display name, split on the first
-                // space. Only used when the account carries no structured name,
-                // and only when it actually splits into two parts - a single word
-                // gives no surname, and a partial prefill just leaves the step in
-                // the flow anyway.
-                if ($first === '' && $last === '') {
-                    $display = trim((string) $user->display_name);
-                    if ($display !== '' && strpos($display, ' ') !== false) {
-                        $parts = preg_split('/\s+/', $display, 2);
-                        $first = trim($parts[0]);
-                        $last  = isset($parts[1]) ? trim($parts[1]) : '';
-                    }
-                }
-            }
-        }
-
-        $rejected = array();
-        $adjusted = array();
-
-        // Email is the buyer's actual identity - it is validated, never altered.
-        // An approximate email would pre-register the wrong person.
-        if ($email !== '' && is_email($email)) {
-            $prefill['email'] = $email;
-        } elseif ($email !== '') {
-            $rejected[] = 'email (not a valid address)';
-        }
-
-        // Names only have to be close enough to pass validation, so they are
-        // reshaped rather than dropped.
-        foreach (array('firstName' => $first, 'lastName' => $last) as $key => $raw) {
-            if ($raw === '') {
-                continue;
-            }
-
-            $clean = $this->sanitize_prefill_name($raw);
-
-            if ($clean === '' || !$this->is_prefillable_name($clean)) {
-                $rejected[] = $key . ' (nothing usable in "' . $raw . '")';
-                continue;
-            }
-
-            if ($clean !== $raw) {
-                $adjusted[] = $key . ': "' . $raw . '" -> "' . $clean . '"';
-            }
-
-            $prefill[$key] = $clean;
-        }
-
-        // All three must be present and valid; anything less leaves the step in
-        // the flow, so send a partial set only because it costs nothing.
-        if (!empty($adjusted)) {
-            error_log('PP Gateway: buyer prefill name(s) normalised to pass validation - ' . implode(' | ', $adjusted));
-        }
-
-        if (count($prefill) === 3) {
-            error_log('PP Gateway: buyer prefill complete (email + firstName + lastName) - checkout should skip the personal-information step');
-        } else {
-            $have = empty($prefill) ? 'nothing' : implode(', ', array_keys($prefill));
-            $why  = empty($rejected) ? '' : ' | rejected: ' . implode(', ', $rejected);
-            error_log('PP Gateway: buyer prefill INCOMPLETE (have: ' . $have . $why
-                . ') - checkout will still ask. All three must be present and valid to skip.');
-        }
-
-        return $prefill;
+        return trim($details) !== '' ? $details : $default;
     }
 
     private function get_source_metadata() {
@@ -1297,15 +1128,7 @@ class WC_Gateway_SP extends WC_Payment_Gateway {
         $tax_total = (float) $order->get_total_tax();
         $total_amount = (float) $order->get_total();
         
-        // Build details string with breakdown
-        $details_parts = ['Payment for WooCommerce order #' . $order->get_order_number() . ' with ' . count($product_details) . ' product(s)'];
-        if ($shipping_total > 0) {
-            $details_parts[] = 'Shipping: $' . number_format($shipping_total, 2);
-        }
-        if ($tax_total > 0) {
-            $details_parts[] = 'Tax: $' . number_format($tax_total, 2);
-        }
-        $details_string = implode(' | ', $details_parts);
+        $details_string = $this->get_purchase_session_details($order);
         
         $success_url = $this->get_return_url($order);
         error_log('PP Gateway: Success URL: ' . $success_url);
@@ -1316,7 +1139,7 @@ class WC_Gateway_SP extends WC_Payment_Gateway {
             'currency' => $order->get_currency(),
             'amount' => $total_amount,
             'recurring' => $is_subscription,
-            'metadata' => array_merge($this->get_source_metadata(), $this->get_buyer_prefill_metadata($order), array(
+            'metadata' => array_merge($this->get_source_metadata(), array(
                 'payment_gateway' => 'stablecoin_pay', // Identifier for data/analytics purposes
                 'payment_type' => 'stablecoin_pay', // Payment type identifier
                 'woocommerce_order_id' => $order->get_id(),
@@ -3263,11 +3086,11 @@ class WC_Gateway_SP extends WC_Payment_Gateway {
 
         $session_data = array(
             'name' => $session_name,
-            'details' => $this->get_order_details_text($order, $cart_data),
+            'details' => $this->get_purchase_session_details($order),
             'currency' => $cart_data['currency'],
             'amount' => $cart_data['total'],
             'recurring' => $cart_data['has_subscription'],
-            'metadata' => array_merge($this->get_source_metadata(), $this->get_buyer_prefill_metadata($order), array(
+            'metadata' => array_merge($this->get_source_metadata(), array(
                 'payment_gateway' => 'stablecoin_pay', // Identifier for data/analytics purposes
                 'payment_type' => 'stablecoin_pay', // Payment type identifier
                 'woocommerce_order_id' => $order->get_id(),
