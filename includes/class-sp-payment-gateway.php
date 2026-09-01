@@ -755,7 +755,17 @@ class WC_Gateway_SP extends WC_Payment_Gateway {
                 throw new Exception('Checkout URL not received from API');
             }
             
-            error_log('PP Gateway: Checkout URL from API: ' . $checkout_url);
+            error_log('PP Gateway: Checkout URL from API (verbatim, before any host rewrite): ' . $checkout_url);
+
+            // Purchase sessions are served at /checkout/{code}. The bare /{code}
+            // route belongs to subscription products, so a URL without the prefix
+            // resolves to a 404 page that has no Turbo frame - which surfaces to the
+            // buyer as "Content missing" rather than a readable error.
+            //
+            // The plugin redirects to whatever `url` the API returned and never
+            // assembles this itself, so if the prefix is absent it was absent in the
+            // response. Flag it here rather than letting it fail silently downstream.
+            $checkout_url = $this->normalize_checkout_url($checkout_url);
             
             // Decide which host the customer's checkout page should live on. The hosted buy app
             // brands itself purely from the Host it is served on, so this line decides which
@@ -783,23 +793,36 @@ class WC_Gateway_SP extends WC_Payment_Gateway {
                     if ($checkout_url_parts && isset($checkout_url_parts['scheme'], $checkout_url_parts['host'])) {
                         $original_domain = $checkout_url_parts['scheme'] . '://' . $checkout_url_parts['host'];
 
-                        if ($original_domain !== $whitelabel_domain) {
-                            // The session was created on one host and we are sending
-                            // the buyer to another. That is intended for whitelabel
-                            // branding (the buy app brands itself from the Host it is
-                            // served on), but it only works when both hosts front the
-                            // SAME environment. If the merchant account does not live
-                            // on the configured buy host, the session will not exist
-                            // there and the buyer gets a bare 404.
-                            error_log('PP Gateway: ⚠️ rewriting checkout host ' . $original_domain
-                                . ' -> ' . $whitelabel_domain
-                                . ' — if the buyer sees a 404, these two hosts are different environments;'
-                                . ' either point buy_base_url in sp-whitelabel-config.php at '
-                                . $original_domain . ', or use credentials from that environment.');
+                        // The session exists only on the environment that created it.
+                        // The API host and the buy host are configured separately, so
+                        // they can drift apart - and rewriting across that gap sends
+                        // the shopper to a host where the session was never created,
+                        // which is a guaranteed 404 no matter how correct the path is.
+                        //
+                        // Branding is not worth a broken checkout: when the two hosts
+                        // are different environments, keep the URL the API gave us.
+                        $api_env = $this->host_environment(wp_parse_url($api_base_url, PHP_URL_HOST));
+                        $buy_env = $this->host_environment($buyurl_parts['host']);
+
+                        if ($api_env !== '' && $buy_env !== '' && $api_env !== $buy_env) {
+                            error_log('PP Gateway: ⚠️ NOT rewriting the checkout host - the session was created on "'
+                                . $api_env . '" but buy_base_url points at "' . $buy_env . '".'
+                                . ' Sending the shopper to ' . $original_domain . ' where the session actually exists.'
+                                . ' Fix sp-whitelabel-config.php so environment_id/buy_base_url match the credentials\' environment.');
+                            error_log('PP Gateway: FINAL CHECKOUT URL: ' . $checkout_url);
+                            $skip_host_rewrite = true;
                         }
 
-                        $checkout_url = str_replace($original_domain, $whitelabel_domain, $checkout_url);
-                        error_log('PP Gateway: Whitelabel checkout URL: ' . $checkout_url);
+                        if (empty($skip_host_rewrite)) {
+                            if ($original_domain !== $whitelabel_domain) {
+                                error_log('PP Gateway: rewriting checkout host for branding: '
+                                    . $original_domain . ' -> ' . $whitelabel_domain
+                                    . ' (same environment, session resolves on both)');
+                            }
+
+                            $checkout_url = str_replace($original_domain, $whitelabel_domain, $checkout_url);
+                            error_log('PP Gateway: Whitelabel checkout URL: ' . $checkout_url);
+                        }
                     }
                 }
             }
@@ -972,6 +995,99 @@ class WC_Gateway_SP extends WC_Payment_Gateway {
      */
     private function is_prefillable_name($name) {
         return (bool) preg_match('/^[\p{L} ]+$/u', $name);
+    }
+
+    /**
+     * The environment a host belongs to, ignoring its subdomain.
+     *
+     *   api.coinsub.io      -> coinsub.io
+     *   buy.syncharge.io    -> syncharge.io
+     *   test-api.coinsub.io -> coinsub.io
+     *
+     * Used to tell whether the host that created a purchase session and the host
+     * we are about to send the shopper to are the same environment. They are
+     * configured independently, so they can drift.
+     *
+     * @param string $host
+     * @return string Empty when the host cannot be read.
+     */
+    private function host_environment($host) {
+        $host = strtolower(trim((string) $host));
+        if ($host === '') {
+            return '';
+        }
+
+        $labels = explode('.', $host);
+        if (count($labels) < 2) {
+            return $host;
+        }
+
+        // Keep the registrable-ish tail. Two labels covers coinsub.io and
+        // syncharge.io; three keeps something like example.co.uk intact.
+        $tail = array_slice($labels, -2);
+        if (count($labels) >= 3 && strlen(end($labels)) <= 2 && strlen($labels[count($labels) - 2]) <= 3) {
+            $tail = array_slice($labels, -3);
+        }
+
+        return implode('.', $tail);
+    }
+
+    /**
+     * Make sure a checkout URL points at the purchase-session route.
+     *
+     * Purchase sessions are served at `/checkout/{code}`. The bare `/{code}` route
+     * belongs to subscription products, so a URL missing the prefix resolves to a
+     * 404 page - and because that page carries no Turbo frame, the buyer sees
+     * "Content missing" rather than anything actionable.
+     *
+     * The plugin redirects to whatever `url` the API returns and never assembles
+     * this itself, so a missing prefix is a server-side quirk. This repairs it in
+     * transit rather than sending a customer to a dead page.
+     *
+     * Deliberately conservative - it only acts when the path is a single segment
+     * that looks like a session code. A multi-segment path is left alone, because
+     * that is a route this method does not understand.
+     *
+     * @param string $url
+     * @return string
+     */
+    private function normalize_checkout_url($url) {
+        if (!is_string($url) || $url === '') {
+            return $url;
+        }
+
+        $parts = wp_parse_url($url);
+        if (!$parts || empty($parts['scheme']) || empty($parts['host']) || empty($parts['path'])) {
+            return $url;
+        }
+
+        // Already correct.
+        if (strpos($parts['path'], '/checkout/') !== false) {
+            return $url;
+        }
+
+        $segments = array_values(array_filter(explode('/', $parts['path']), 'strlen'));
+        if (count($segments) !== 1) {
+            return $url;
+        }
+
+        $code = $segments[0];
+        if (!preg_match('/^[A-Za-z0-9][A-Za-z0-9_-]{5,63}$/', $code)) {
+            return $url;
+        }
+
+        $rebuilt = $parts['scheme'] . '://' . $parts['host']
+            . (isset($parts['port']) ? ':' . $parts['port'] : '')
+            . '/checkout/' . $code
+            . (isset($parts['query']) ? '?' . $parts['query'] : '')
+            . (isset($parts['fragment']) ? '#' . $parts['fragment'] : '');
+
+        error_log('PP Gateway: ⚠️ checkout URL was missing the /checkout/ prefix - repaired '
+            . $url . ' -> ' . $rebuilt
+            . ' (the bare /{code} route is the subscription-product route and 404s). '
+            . 'This came from the API response unmodified; worth reporting upstream.');
+
+        return apply_filters('sp_normalized_checkout_url', $rebuilt, $url);
     }
 
     /**
