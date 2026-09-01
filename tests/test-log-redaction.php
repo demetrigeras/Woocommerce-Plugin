@@ -37,8 +37,12 @@ check('source', $safe['metadata']['source'] === 'woocommerce_plugin');
 check('site domain', $safe['metadata']['site_domain'] === 'shop.example.com');
 check('order breakdown', $safe['metadata']['order_breakdown']['subtotal'] === 40.00);
 check('redacted keys remain visible as present', $safe['metadata']['customer_email'] === '[redacted]');
-check('nested structure kept, values masked',
-    $safe['metadata']['products'][0]['qty'] === 2 && $safe['metadata']['products'][0]['name'] === '[redacted]');
+// A product name is not personal data, and hiding it makes checkout problems
+// impossible to diagnose from the log. Customer names arrive as first_name /
+// last_name / customer_name and are still masked - asserted below.
+check('nested structure and product names kept',
+    $safe['metadata']['products'][0]['qty'] === 2 && $safe['metadata']['products'][0]['name'] === 'Widget',
+    json_encode($safe['metadata']['products'][0]));
 
 section('Webhook payload');
 $wh = SP_API_Client::redact_for_log(array(
@@ -56,6 +60,38 @@ check('empty sensitive value marked [empty]',
     SP_API_Client::redact_for_log(array('customer_email' => ''))['customer_email'] === '[empty]');
 $deep = array('a'=>array('b'=>array('c'=>array('d'=>array('e'=>array('f'=>array('email'=>'x@y.z')))))));
 check('deep nesting does not error', is_array(SP_API_Client::redact_for_log($deep)));
+
+
+section('Payer-visible fields stay readable; customer names do not');
+$r = SP_API_Client::redact_for_log(array(
+    'name' => 'WooCommerce Order: Widget',
+    'details' => 'Payment for WooCommerce order #1234 with 2 product(s)',
+    'metadata' => array(
+        'customer_name' => 'Jane Doe',
+        'firstName' => 'Jane',
+        'lastName' => 'Doe',
+        'email' => 'jane@example.com',
+        'products' => array(array('name' => 'Widget', 'qty' => 2)),
+        'billing_address' => array('first_name' => 'Jane', 'last_name' => 'Doe', 'city' => 'London'),
+        'order_breakdown' => array('shipping' => array('method' => 'Flat rate')),
+    ),
+));
+check('order name is visible (needed to debug what the payer sees)',
+    $r['name'] === 'WooCommerce Order: Widget', var_export($r['name'], true));
+check('details is visible', strpos($r['details'], 'order #1234') !== false, var_export($r['details'], true));
+check('product name is visible', $r['metadata']['products'][0]['name'] === 'Widget');
+check('customer_name IS still redacted', $r['metadata']['customer_name'] === '[redacted]');
+check('firstName IS still redacted', $r['metadata']['firstName'] === '[redacted]');
+check('lastName IS still redacted', $r['metadata']['lastName'] === '[redacted]');
+check('email IS still redacted', $r['metadata']['email'] === '[redacted]');
+// The whole address block is masked at its key, so nothing inside it survives.
+check('the entire billing_address block is redacted',
+    is_string($r['metadata']['billing_address']) && strpos($r['metadata']['billing_address'], 'redacted') !== false,
+    var_export($r['metadata']['billing_address'], true));
+$j = json_encode($r);
+check('no customer PII anywhere in the log line',
+    strpos($j, 'Jane') === false && strpos($j, 'jane@example.com') === false && strpos($j, 'London') === false, $j);
+
 
 echo "\n" . str_repeat('=', 58) . "\n  $pass passed, $fail failed\n" . str_repeat('=', 58) . "\n";
 exit($fail ? 1 : 0);

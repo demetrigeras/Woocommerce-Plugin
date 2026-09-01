@@ -74,7 +74,12 @@ class SP_API_Client {
         
         $payload = array(
             'name' => $order_data['name'],
-            'details' => $order_data['details'],
+            // Required by the API: an empty or missing value comes back as
+            // "Invalid request payload" and checkout never starts. Callers always
+            // supply this, so the fallback is a guard rather than a feature.
+            'details' => !empty($order_data['details'])
+                ? $order_data['details']
+                : ('Order ' . ($order_data['metadata']['woocommerce_order_id'] ?? '')),
             'currency' => $order_data['currency'],
             'amount' => $order_data['amount'],
             'recurring' => $order_data['recurring'] ?? false,
@@ -437,15 +442,24 @@ class SP_API_Client {
             'ip', 'user_agent', 'customer',
         );
 
+        // Exact keys that merely contain a sensitive word but are not personal data:
+        // a bare `name` here is an order title, a product name or a fee label, and
+        // masking it makes checkout problems impossible to diagnose from the log.
+        // The customer's own name always arrives as first_name / last_name /
+        // customer_name, which the substring scan below still catches.
+        $not_sensitive = array('name', 'display_name', 'product_name', 'item_name', 'fee_name', 'network_name', 'method_name');
+
         $out = array();
         foreach ($data as $key => $value) {
             $key_l = strtolower((string) $key);
 
             $is_sensitive = false;
-            foreach ($sensitive as $needle) {
-                if (strpos($key_l, $needle) !== false) {
-                    $is_sensitive = true;
-                    break;
+            if (!in_array($key_l, $not_sensitive, true)) {
+                foreach ($sensitive as $needle) {
+                    if (strpos($key_l, $needle) !== false) {
+                        $is_sensitive = true;
+                        break;
+                    }
                 }
             }
 

@@ -782,6 +782,22 @@ class WC_Gateway_SP extends WC_Payment_Gateway {
                     $checkout_url_parts = parse_url($checkout_url);
                     if ($checkout_url_parts && isset($checkout_url_parts['scheme'], $checkout_url_parts['host'])) {
                         $original_domain = $checkout_url_parts['scheme'] . '://' . $checkout_url_parts['host'];
+
+                        if ($original_domain !== $whitelabel_domain) {
+                            // The session was created on one host and we are sending
+                            // the buyer to another. That is intended for whitelabel
+                            // branding (the buy app brands itself from the Host it is
+                            // served on), but it only works when both hosts front the
+                            // SAME environment. If the merchant account does not live
+                            // on the configured buy host, the session will not exist
+                            // there and the buyer gets a bare 404.
+                            error_log('PP Gateway: ⚠️ rewriting checkout host ' . $original_domain
+                                . ' -> ' . $whitelabel_domain
+                                . ' — if the buyer sees a 404, these two hosts are different environments;'
+                                . ' either point buy_base_url in sp-whitelabel-config.php at '
+                                . $original_domain . ', or use credentials from that environment.');
+                        }
+
                         $checkout_url = str_replace($original_domain, $whitelabel_domain, $checkout_url);
                         error_log('PP Gateway: Whitelabel checkout URL: ' . $checkout_url);
                     }
@@ -915,6 +931,172 @@ class WC_Gateway_SP extends WC_Payment_Gateway {
      *
      * @return array
      */
+    /**
+     * Reshape a name so the checkout's prefill validation will accept it.
+     *
+     * The server validates first/last name against ^[\p{L} ]+$ - Unicode letters
+     * and spaces only - which rejects perfectly ordinary names: "Mary-Jane",
+     * "O'Brien", "J.R.". Sending those verbatim just gets them discarded and the
+     * buyer is asked to type their details again.
+     *
+     * So names are normalised to fit rather than dropped. An approximate name on
+     * a pre-registered account is an acceptable trade for skipping the step;
+     * the email, which actually identifies the buyer, is never altered.
+     *
+     *   Mary-Jane -> Mary Jane      (separator becomes a space, still readable)
+     *   O'Brien   -> OBrien         (apostrophe dropped, the usual transliteration)
+     *   J.R.      -> JR
+     *   Jane2     -> Jane
+     *
+     * @param string $name
+     * @return string Empty when nothing usable survives.
+     */
+    private function sanitize_prefill_name($name) {
+        // Hyphens and underscores join words - a space keeps the name readable.
+        $name = preg_replace('/[-_]+/u', ' ', $name);
+
+        // Drop everything the server will not accept: apostrophes, periods,
+        // digits, punctuation, symbols. The /u modifier is required for \p{L}
+        // to mean "any Unicode letter" rather than just ASCII.
+        $name = preg_replace('/[^\p{L} ]+/u', '', $name);
+
+        // Collapse the gaps left behind.
+        return trim(preg_replace('/\s+/u', ' ', (string) $name));
+    }
+
+    /**
+     * Whether a name matches the checkout's prefill validation.
+     *
+     * @param string $name
+     * @return bool
+     */
+    private function is_prefillable_name($name) {
+        return (bool) preg_match('/^[\p{L} ]+$/u', $name);
+    }
+
+    /**
+     * The WordPress account an order belongs to, if any.
+     *
+     * Guest checkouts have no account, so this returns false and the caller sends
+     * only what the billing form actually collected.
+     *
+     * @param WC_Order $order
+     * @return WP_User|false
+     */
+    private function get_order_account($order) {
+        $user_id = (int) $order->get_customer_id();
+        if ($user_id <= 0) {
+            return false;
+        }
+
+        $user = get_user_by('id', $user_id);
+        return $user ? $user : false;
+    }
+
+    /**
+     * Buyer details that let hosted checkout skip its personal-information step.
+     *
+     * When `email`, `firstName` and `lastName` are all present in metadata the
+     * buyer is pre-registered and the form is skipped, so a customer who already
+     * typed these at WooCommerce checkout does not type them again.
+     *
+     * Each field is sent only when non-empty. A missing or invalid one just leaves
+     * the step in the flow, but an empty string could read as invalid - which is
+     * worse than omitting it.
+     *
+     * @param WC_Order $order
+     * @return array Empty when the order has nothing usable.
+     */
+    private function get_buyer_prefill_metadata($order) {
+        $prefill = array();
+
+        $email = trim((string) $order->get_billing_email());
+        $first = trim((string) $order->get_billing_first_name());
+        $last  = trim((string) $order->get_billing_last_name());
+
+        // Billing fields win. When the checkout form did not collect a name -
+        // some stores trim those fields down - fall back to the WordPress account
+        // behind the order. Guest orders have no account, so nothing is invented.
+        if ($first === '' || $last === '' || $email === '') {
+            $user = $this->get_order_account($order);
+
+            if ($user) {
+                if ($first === '') {
+                    $first = trim((string) $user->first_name);
+                }
+                if ($last === '') {
+                    $last = trim((string) $user->last_name);
+                }
+                if ($email === '') {
+                    $email = trim((string) $user->user_email);
+                }
+
+                // Last resort: the account's display name, split on the first
+                // space. Only used when the account carries no structured name,
+                // and only when it actually splits into two parts - a single word
+                // gives no surname, and a partial prefill just leaves the step in
+                // the flow anyway.
+                if ($first === '' && $last === '') {
+                    $display = trim((string) $user->display_name);
+                    if ($display !== '' && strpos($display, ' ') !== false) {
+                        $parts = preg_split('/\s+/', $display, 2);
+                        $first = trim($parts[0]);
+                        $last  = isset($parts[1]) ? trim($parts[1]) : '';
+                    }
+                }
+            }
+        }
+
+        $rejected = array();
+        $adjusted = array();
+
+        // Email is the buyer's actual identity - it is validated, never altered.
+        // An approximate email would pre-register the wrong person.
+        if ($email !== '' && is_email($email)) {
+            $prefill['email'] = $email;
+        } elseif ($email !== '') {
+            $rejected[] = 'email (not a valid address)';
+        }
+
+        // Names only have to be close enough to pass validation, so they are
+        // reshaped rather than dropped.
+        foreach (array('firstName' => $first, 'lastName' => $last) as $key => $raw) {
+            if ($raw === '') {
+                continue;
+            }
+
+            $clean = $this->sanitize_prefill_name($raw);
+
+            if ($clean === '' || !$this->is_prefillable_name($clean)) {
+                $rejected[] = $key . ' (nothing usable in "' . $raw . '")';
+                continue;
+            }
+
+            if ($clean !== $raw) {
+                $adjusted[] = $key . ': "' . $raw . '" -> "' . $clean . '"';
+            }
+
+            $prefill[$key] = $clean;
+        }
+
+        // All three must be present and valid; anything less leaves the step in
+        // the flow, so send a partial set only because it costs nothing.
+        if (!empty($adjusted)) {
+            error_log('PP Gateway: buyer prefill name(s) normalised to pass validation - ' . implode(' | ', $adjusted));
+        }
+
+        if (count($prefill) === 3) {
+            error_log('PP Gateway: buyer prefill complete (email + firstName + lastName) - checkout should skip the personal-information step');
+        } else {
+            $have = empty($prefill) ? 'nothing' : implode(', ', array_keys($prefill));
+            $why  = empty($rejected) ? '' : ' | rejected: ' . implode(', ', $rejected);
+            error_log('PP Gateway: buyer prefill INCOMPLETE (have: ' . $have . $why
+                . ') - checkout will still ask. All three must be present and valid to skip.');
+        }
+
+        return $prefill;
+    }
+
     private function get_source_metadata() {
         $site_url = home_url();
 
@@ -1018,7 +1200,7 @@ class WC_Gateway_SP extends WC_Payment_Gateway {
             'currency' => $order->get_currency(),
             'amount' => $total_amount,
             'recurring' => $is_subscription,
-            'metadata' => array_merge($this->get_source_metadata(), array(
+            'metadata' => array_merge($this->get_source_metadata(), $this->get_buyer_prefill_metadata($order), array(
                 'payment_gateway' => 'stablecoin_pay', // Identifier for data/analytics purposes
                 'payment_type' => 'stablecoin_pay', // Payment type identifier
                 'woocommerce_order_id' => $order->get_id(),
@@ -2969,7 +3151,7 @@ class WC_Gateway_SP extends WC_Payment_Gateway {
             'currency' => $cart_data['currency'],
             'amount' => $cart_data['total'],
             'recurring' => $cart_data['has_subscription'],
-            'metadata' => array_merge($this->get_source_metadata(), array(
+            'metadata' => array_merge($this->get_source_metadata(), $this->get_buyer_prefill_metadata($order), array(
                 'payment_gateway' => 'stablecoin_pay', // Identifier for data/analytics purposes
                 'payment_type' => 'stablecoin_pay', // Payment type identifier
                 'woocommerce_order_id' => $order->get_id(),

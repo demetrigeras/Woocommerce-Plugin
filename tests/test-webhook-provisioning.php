@@ -1012,6 +1012,63 @@ check('a secret-bearing registered URL is still matched as ours',
 check('  -> adopted, not duplicated', SP_Webhook_Provisioner::webhook_id() === 950);
 
 
+
+// ==================================== 18. Existing accounts on the old callback URL
+section('18. Accounts registered before the rename keep working');
+
+// An account set up months ago: dashboard holds the stablecoin/v1 URL with the
+// site's shared secret on it, and no signing secret was ever issued.
+reset_state();
+$GLOBALS['options']['sp_webhook_secret'] = 'shared_old';
+$handler = new SP_Webhook_Handler();
+$body = '{"type":"payment","origin_id":"sess-old"}';
+
+// The old route is still served, and the old credential still verifies.
+check('legacy namespace is still registered',
+    in_array('stablecoin/v1', SP_Webhook_Provisioner::all_namespaces(), true));
+$res = invoke($handler, 'verify_delivery', array(
+    new FakeRequest(array(), $body, array('secret' => 'shared_old')), $body));
+check('a delivery on the old URL still authenticates', $res === true);
+
+// ...so nothing has to be migrated for deliveries to keep landing.
+// On the next settings save the record is repointed to the canonical URL anyway.
+reset_state();
+$GLOBALS['options']['sp_webhook_secret'] = 'shared_old';
+$GLOBALS['api'] = function ($method, $url) {
+    if ($method === 'GET') {
+        return json_reply(200, array('webhooks' => array(array(
+            'webhook_id' => 1200,
+            'url' => 'https://shop.example.com/wp-json/stablecoin/v1/webhook?secret=shared_old',
+            'status' => 'active',
+        ))));
+    }
+    if ($method === 'PUT') { return json_reply(200, array('message' => 'updated')); }
+    if (str_ends_with($url, '/rotate-secret')) { return json_reply(200, array('signing_secret' => 'whsec_new')); }
+    return json_reply(500, array('message' => 'MUST NOT CREATE A DUPLICATE'));
+};
+$r = SP_Webhook_Provisioner::sync();
+$creates = array_filter($GLOBALS['http_log'], function ($c) {
+    return $c['method'] === 'POST' && !str_ends_with($c['url'], '/rotate-secret');
+});
+check('an old-URL webhook is adopted, never duplicated',
+    ($r['state'] ?? '') === 'ok' && count($creates) === 0, json_encode($r));
+check('  -> same webhook id kept', SP_Webhook_Provisioner::webhook_id() === 1200);
+
+// THE DRIFT CASE: the registered URL carries a secret this site no longer has
+// (options reset, site migrated, secret regenerated). Deliveries cannot verify
+// until the record is re-registered with the current secret.
+reset_state();
+$GLOBALS['options']['sp_webhook_secret'] = 'shared_NEW';
+$handler = new SP_Webhook_Handler();
+$res = invoke($handler, 'verify_delivery', array(
+    new FakeRequest(array(), $body, array('secret' => 'shared_old')), $body));
+check('a stale secret on the old URL is correctly rejected',
+    $res instanceof WP_Error, is_object($res) ? get_class($res) : var_export($res, true));
+check('  -> and re-registration would carry the CURRENT secret',
+    strpos(SP_Webhook_Provisioner::registration_callback_url(), 'secret=shared_NEW') !== false,
+    SP_Webhook_Provisioner::registration_callback_url());
+
+
 echo "\n" . str_repeat('=', 62) . "\n";
 printf("  %d passed, %d failed\n", $pass, $fail);
 echo str_repeat('=', 62) . "\n";
