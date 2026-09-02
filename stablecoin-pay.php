@@ -909,6 +909,24 @@ function sp_register_order_statuses() {
             'stablecoin-pay'
         ),
     ));
+
+    // WooCommerce has no core "partially refunded" status - a partial refund
+    // leaves the order in whatever status it was already in, which reads as
+    // "nothing was refunded". Register one so a partial payout is visible in the
+    // orders list instead of being indistinguishable from an untouched order.
+    register_post_status('wc-partially-refunded', array(
+        'label'                     => _x('Partially refunded', 'Order status', 'stablecoin-pay'),
+        'public'                    => false,
+        'exclude_from_search'       => false,
+        'show_in_admin_all_list'    => true,
+        'show_in_admin_status_list' => true,
+        /* translators: %s: order count */
+        'label_count'               => _n_noop(
+            'Partially refunded <span class="count">(%s)</span>',
+            'Partially refunded <span class="count">(%s)</span>',
+            'stablecoin-pay'
+        ),
+    ));
 }
 add_action('init', 'sp_register_order_statuses');
 
@@ -923,12 +941,18 @@ function sp_add_order_statuses($statuses) {
 
     foreach ($statuses as $key => $label) {
         $reordered[$key] = $label;
-        // Sit next to the built-in refunded status, where a merchant looks for it.
+        // Sit next to the built-in refunded status, where a merchant looks for them.
         if ($key === 'wc-refunded') {
-            $reordered['wc-refund-pending'] = _x('Refund pending', 'Order status', 'stablecoin-pay');
+            $reordered['wc-partially-refunded'] = _x('Partially refunded', 'Order status', 'stablecoin-pay');
+            $reordered['wc-refund-pending']     = _x('Refund pending', 'Order status', 'stablecoin-pay');
         }
     }
 
+    // If the built-in refunded status was filtered out by something else, still
+    // make ours available rather than dropping them silently.
+    if (!isset($reordered['wc-partially-refunded'])) {
+        $reordered['wc-partially-refunded'] = _x('Partially refunded', 'Order status', 'stablecoin-pay');
+    }
     if (!isset($reordered['wc-refund-pending'])) {
         $reordered['wc-refund-pending'] = _x('Refund pending', 'Order status', 'stablecoin-pay');
     }

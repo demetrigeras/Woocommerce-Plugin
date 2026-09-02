@@ -836,8 +836,46 @@ class SP_Webhook_Handler {
             }
             $order->add_order_note($refund_note);
             
-            if ($order->get_status() !== 'refunded') {
-                $order->update_status('refunded', __('Refund completed via Stablecoin Pay', 'stablecoin-pay'));
+            // Full or partial? WooCommerce's own refund records are authoritative -
+            // they are what the merchant sees in the order totals. Fall back to the
+            // amount the webhook reported when the refund was started outside the
+            // store, so a dashboard-initiated payout still lands somewhere sensible
+            // rather than being treated as a full refund.
+            $order_total    = (float) $order->get_total();
+            $refunded_total = (float) $order->get_total_refunded();
+
+            if ($refunded_total <= 0 && $amount !== null && is_numeric($amount)) {
+                $refunded_total = (float) $amount;
+            }
+
+            // Compare in cents to keep float noise out of the decision.
+            $is_partial = $order_total > 0
+                && $refunded_total > 0
+                && round($refunded_total, 2) < round($order_total, 2);
+
+            $target_status = $is_partial ? 'partially-refunded' : 'refunded';
+
+            error_log(sprintf(
+                'PP Webhook: refund %s - %s of %s refunded on order #%d -> status "%s"',
+                $is_partial ? 'PARTIAL' : 'FULL',
+                $refunded_total,
+                $order_total,
+                $order->get_id(),
+                $target_status
+            ));
+
+            if ($order->get_status() !== $target_status) {
+                $order->update_status(
+                    $target_status,
+                    $is_partial
+                        ? sprintf(
+                            /* translators: 1: amount refunded, 2: order total */
+                            __('Partial refund completed via Stablecoin Pay (%1$s of %2$s)', 'stablecoin-pay'),
+                            wc_price($refunded_total),
+                            wc_price($order_total)
+                        )
+                        : __('Refund completed via Stablecoin Pay', 'stablecoin-pay')
+                );
             }
             error_log('✅ PP Webhook: Refund marked as successful for order #' . $order->get_id());
         } else {
