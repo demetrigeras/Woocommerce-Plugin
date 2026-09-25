@@ -30,6 +30,12 @@ class SP_Webhook_Handler {
     /** Seconds a delivery's timestamp may differ from ours before we reject it. */
     const SIGNATURE_TOLERANCE = 300;
 
+    /**
+     * Marks the network-fee line item, and on the order records the amount applied so
+     * a retried delivery cannot add a second one.
+     */
+    const NETWORK_FEE_META = '_sp_network_fee';
+
     /** How long a handled event id is remembered, to absorb delivery retries. */
     const EVENT_DEDUPE_TTL = DAY_IN_SECONDS;
 
@@ -500,6 +506,16 @@ class SP_Webhook_Handler {
             }
         }
         
+        // The network fee is charged inside the hosted checkout, after WooCommerce has
+        // finished totalling the order, so it can only be recorded once the payment has
+        // landed. Until it is, the order summary is short by the fee and doesn't add up
+        // to what the customer actually paid.
+        //
+        // Deliberately before the status change below: that change is what sends the
+        // customer their "order is processing" email, and the email must quote the total
+        // including the fee.
+        $this->maybe_add_network_fee($order, $data);
+
         // Store status as Processing only (merchant sees Processing). Customer sees "Completed" via display filter in class-sp-subscriptions.
         $current_status = $order->get_status();
         error_log('PP Webhook: Current order status BEFORE update: ' . $current_status);
@@ -701,6 +717,65 @@ class SP_Webhook_Handler {
         error_log('PP Webhook: PAYMENT COMPLETE for order #' . $order->get_id() . ' | Transaction Hash: ' . ($transaction_hash ?? 'N/A'));
     }
     
+    /**
+     * Record the payment method's flat network fee on the order as a fee line.
+     *
+     * The customer is shown and charged this inside the hosted checkout, which happens
+     * after WooCommerce has finished totalling the order - so WooCommerce's copy of the
+     * order is short by the fee until we add it here. Recording it as a real fee item
+     * rather than a note or a meta field is what makes it appear in the My Account order
+     * summary, the emails and the admin order screen, with the numbers adding up to the
+     * amount actually paid in all three.
+     *
+     * Idempotent: deliveries retry, so the applied amount is stamped on the order and a
+     * second run does nothing.
+     *
+     * @param WC_Order $order
+     * @param array    $data Webhook payload, used only to log the provider's own figure.
+     * @return void
+     */
+    private function maybe_add_network_fee($order, $data = array()) {
+        if ($order->meta_exists(self::NETWORK_FEE_META)) {
+            return;
+        }
+
+        $fee_amount = class_exists('SP_Whitelabel_Branding')
+            ? SP_Whitelabel_Branding::get_network_fee_from_config()
+            : 0.0;
+
+        if ($fee_amount <= 0) {
+            return;
+        }
+
+        $fee = new WC_Order_Item_Fee();
+        $fee->set_name(__('Network fee', 'stablecoin-pay'));
+        $fee->set_amount($fee_amount);
+        $fee->set_total($fee_amount);
+        // Taxing it would introduce a difference the customer was never charged, which
+        // is the one thing this line exists to avoid.
+        $fee->set_tax_status('none');
+        $fee->set_total_tax(0);
+        // Marks the line as ours, so a renewal order does not inherit a copy of it.
+        $fee->add_meta_data(self::NETWORK_FEE_META, 'yes', true);
+        $order->add_item($fee);
+
+        // Set the total explicitly instead of recalculating. The order total can come
+        // from the figure the block checkout rendered to the customer, and
+        // calculate_totals() would rederive it from the line items and discard that.
+        $previous_total = (float) $order->get_total();
+        $order->set_total(round($previous_total + $fee_amount, 2));
+        $order->update_meta_data(self::NETWORK_FEE_META, $fee_amount);
+
+        error_log(sprintf(
+            'PP Webhook: recorded %s network fee on order #%d (total %s -> %s)%s',
+            $fee_amount,
+            $order->get_id(),
+            $previous_total,
+            $order->get_total(),
+            isset($data['amount']) ? ' | provider reported amount: ' . $data['amount'] : ''
+        ));
+    }
+
     /**
      * Handle payment failed
      * Only called if order is NOT already in a successful state
@@ -1384,6 +1459,12 @@ class SP_Webhook_Handler {
             
             // Copy fees
             foreach ($parent_order->get_items('fee') as $item_id => $fee_item) {
+                // The network fee belongs to one payment, not to the subscription. This
+                // renewal gets its own when its payment completes, so copying the
+                // parent's would charge it twice.
+                if ($fee_item->get_meta(self::NETWORK_FEE_META) === 'yes') {
+                    continue;
+                }
                 $fee = new WC_Order_Item_Fee();
                 $fee->set_name($fee_item->get_name());
                 $fee->set_total($fee_item->get_total());

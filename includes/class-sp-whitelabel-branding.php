@@ -65,6 +65,33 @@ class SP_Whitelabel_Branding {
     }
 
     /**
+     * Flat network fee this build's payment method charges per payment (config key
+     * network_fee), in the store's currency.
+     *
+     * Zero on builds that do not set it, which switches the fee line off entirely.
+     * Filterable so a merchant can correct the figure without rebuilding the zip.
+     *
+     * @return float
+     */
+    public static function get_network_fee_from_config() {
+        $fee = 0.0;
+
+        if (defined('SP_PLUGIN_DIR')) {
+            $path = SP_PLUGIN_DIR . self::WHITELABEL_CONFIG_FILE;
+            if (is_readable($path)) {
+                $config = include $path;
+                if (is_array($config) && isset($config['network_fee']) && is_numeric($config['network_fee'])) {
+                    $fee = (float) $config['network_fee'];
+                }
+            }
+        }
+
+        $fee = (float) apply_filters('sp_network_fee', $fee);
+
+        return $fee > 0 ? round($fee, 2) : 0.0;
+    }
+
+    /**
      * API base URL override for test/staging builds (config key api_base_url).
      * Null on production builds, where callers derive the URL from environment_id.
      *
