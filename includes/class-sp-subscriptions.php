@@ -44,6 +44,7 @@ class SP_Subscriptions {
         // Only for Stablecoin Pay: hide on-hold rows; show "Completed" instead of "Processing" for customers
         add_filter('woocommerce_my_account_my_orders_query', array($this, 'my_account_orders_query_passthrough'));
         add_action('woocommerce_my_account_my_orders_column_order-total', array($this, 'orders_list_mark_sp'), 20, 1);
+        add_filter('woocommerce_my_account_my_orders_actions', array($this, 'my_account_order_actions'), 20, 2);
         add_action('wp_footer', array($this, 'my_account_hide_sp_on_hold_rows'));
         add_action('woocommerce_order_details_after_order_table', array($this, 'view_order_show_completed_for_sp'), 5, 1);
         
@@ -291,6 +292,32 @@ class SP_Subscriptions {
         if ($order->get_payment_method() === 'sp') {
             echo ' <span class="sp-order" style="display:none;"></span>';
         }
+    }
+
+    /**
+     * My Account > Orders actions column.
+     *
+     * Stablecoin Pay settles on-chain through the hosted checkout, so WooCommerce's
+     * Pay and Cancel actions never apply: "Pay" points at an order-pay form this
+     * gateway does not use, and "Cancel" cancels the WooCommerce order without
+     * touching anything on the provider side. Only View is left.
+     *
+     * Cancelling a subscription is deliberately NOT offered here - it lives in the
+     * Subscription panel on the single order page, next to the dates and the
+     * payments collected, so the customer sees what they are cancelling.
+     *
+     * @param array    $actions
+     * @param WC_Order $order
+     * @return array
+     */
+    public function my_account_order_actions($actions, $order) {
+        if (!$order instanceof WC_Order || $order->get_payment_method() !== 'sp') {
+            return $actions;
+        }
+
+        unset($actions['pay'], $actions['cancel']);
+
+        return $actions;
     }
 
     /**
