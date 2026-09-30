@@ -34,34 +34,9 @@ class SP_Webhook_Handler {
     const EVENT_DEDUPE_TTL = DAY_IN_SECONDS;
 
     /**
-     * @var self|null First handler booted, reused by instance().
-     */
-    private static $instance = null;
-
-    /**
-     * The handler this site is running.
-     *
-     * SP_Order_Manager replays handle_payment_completed() through this when polling
-     * finds a payment the webhook never delivered. Going through here rather than
-     * `new` keeps the REST route and AJAX callbacks registered exactly once.
-     *
-     * @return self
-     */
-    public static function instance() {
-        if (self::$instance === null) {
-            self::$instance = new self();
-        }
-        return self::$instance;
-    }
-
-    /**
      * Constructor
      */
     public function __construct() {
-        if (self::$instance === null) {
-            self::$instance = $this;
-        }
-
         add_action('rest_api_init', array($this, 'register_webhook_endpoint'));
         add_action('wp_ajax_sp_test_connection', array($this, 'test_connection'));
         add_action('wp_ajax_nopriv_sp_test_connection', array($this, 'test_connection'));
@@ -488,15 +463,9 @@ class SP_Webhook_Handler {
     }
     
     /**
-     * Handle payment completed.
-     *
-     * Public because SP_Order_Manager::sync_order_status() replays it when a delivery
-     * was missed: an order confirmed by polling must end up with the same status,
-     * notes, meta and emails as one confirmed by a webhook. Every field below the
-     * status update is optional, so a payload from the purchase-session status
-     * endpoint is safe to pass even though it carries fewer keys than a delivery.
+     * Handle payment completed
      */
-    public function handle_payment_completed($order, $data) {
+    private function handle_payment_completed($order, $data) {
         error_log('🎉 PP Webhook: Processing payment completion for order #' . $order->get_id());
         error_log('PP Webhook: Current order status: ' . $order->get_status());
         
@@ -531,10 +500,6 @@ class SP_Webhook_Handler {
             }
         }
         
-        // Compare what the provider settled against what this order should have cost,
-        // before the status change below turns it into a paid order.
-        $this->verify_paid_amount($order, $data);
-
         // Store status as Processing only (merchant sees Processing). Customer sees "Completed" via display filter in class-sp-subscriptions.
         $current_status = $order->get_status();
         error_log('PP Webhook: Current order status BEFORE update: ' . $current_status);
@@ -554,12 +519,11 @@ class SP_Webhook_Handler {
             if ($new_status !== $target_status) {
                 error_log('⚠️ PP Webhook: WARNING - Status update may have failed! Expected: ' . $target_status . ', Got: ' . $new_status);
                 
-                // Fallback: set the status directly on the order and save. Deliberately
-                // NOT wp_update_post() - under High-Performance Order Storage the posts
-                // table is no longer where orders live, so writing post_status there is
-                // either ignored or leaves the two stores disagreeing.
-                $order->set_status($target_status);
-                $order->save();
+                // Try direct database update as fallback
+                wp_update_post(array(
+                    'ID' => $order->get_id(),
+                    'post_status' => 'wc-' . $target_status
+                ));
                 
                 // Reload order and verify
                 $order = wc_get_order($order->get_id());
@@ -710,14 +674,8 @@ class SP_Webhook_Handler {
         
         // Emails are now handled by WooCommerce order status hooks
         
-        // Clear cart and session data since payment is now complete (only if available).
-        // Only when this session was actually paying for THIS order: polling replays this
-        // method from a live front-end request, where an unconditional empty_cart() would
-        // wipe a shopper's unrelated basket.
-        $session_order_id = (function_exists('WC') && WC()->session)
-            ? (int) WC()->session->get('sp_pending_order_id')
-            : 0;
-        if (function_exists('WC') && WC()->cart && $session_order_id === $order->get_id()) {
+        // Clear cart and session data since payment is now complete (only if available)
+        if (function_exists('WC') && WC()->cart) {
             WC()->cart->empty_cart();
         }
         if (function_exists('WC') && WC()->session) {
@@ -743,98 +701,6 @@ class SP_Webhook_Handler {
         error_log('PP Webhook: PAYMENT COMPLETE for order #' . $order->get_id() . ' | Transaction Hash: ' . ($transaction_hash ?? 'N/A'));
     }
     
-    /**
-     * Compare what the provider settled against what this order should have cost.
-     *
-     * A mismatch is never a reason to refuse the order. The payment has already
-     * happened on-chain, and refusing would leave the customer charged and
-     * unfulfilled, which is strictly worse than being overcharged or undercharged.
-     * It is a reason to say so loudly, so the discrepancy is recorded as an order
-     * note and in the log rather than passing silently.
-     *
-     * @param WC_Order $order
-     * @param array    $data Webhook payload.
-     * @return void
-     */
-    private function verify_paid_amount($order, $data) {
-        $reported = $this->extract_paid_amount($data);
-
-        if ($reported === null) {
-            error_log('PP Webhook: no amount in the payload for order #' . $order->get_id()
-                . ' - cannot verify what was actually charged');
-            return;
-        }
-
-        $expected   = round((float) $order->get_total(), 2);
-        $reported   = round($reported, 2);
-        $difference = round($reported - $expected, 2);
-
-        $order->update_meta_data('_sp_paid_amount', $reported);
-
-        // Sub-cent drift is rounding between two systems, not a discrepancy.
-        $tolerance = (float) apply_filters('sp_amount_tolerance', 0.01, $order);
-
-        if (abs($difference) <= $tolerance) {
-            error_log(sprintf(
-                'PP Webhook: amount verified for order #%d - charged %s, order total %s',
-                $order->get_id(), $reported, $expected
-            ));
-            return;
-        }
-
-        $order->update_meta_data('_sp_amount_mismatch', $difference);
-
-        $as_money = function ($value) use ($order) {
-            return function_exists('wc_price')
-                ? wp_strip_all_tags(wc_price($value, array('currency' => $order->get_currency())))
-                : (string) $value;
-        };
-
-        $order->add_order_note(sprintf(
-            /* translators: 1: amount actually charged, 2: order total, 3: the difference */
-            __('Amount mismatch: the payment settled for %1$s but this order totals %2$s (difference %3$s). The payment was accepted - review this order before fulfilling it.', 'stablecoin-pay'),
-            $as_money($reported),
-            $as_money($expected),
-            $as_money($difference)
-        ));
-
-        error_log(sprintf(
-            '⚠️ PP Webhook: AMOUNT MISMATCH on order #%d - charged %s, order total %s, difference %s',
-            $order->get_id(), $reported, $expected, $difference
-        ));
-    }
-
-    /**
-     * Amount the provider says was charged, or null when the payload does not say.
-     *
-     * Deliberately narrow. `transaction_details` carries a token amount rather than a
-     * fiat one, so reading a figure from there would compare USDC against dollars and
-     * report a mismatch on every single order.
-     *
-     * @param array $data
-     * @return float|null
-     */
-    private function extract_paid_amount($data) {
-        if (!is_array($data)) {
-            return null;
-        }
-
-        $nodes = array($data);
-        if (isset($data['data']) && is_array($data['data'])) {
-            $nodes[] = $data['data'];
-        }
-
-        foreach ($nodes as $node) {
-            foreach (array('amount', 'amount_in_usd') as $key) {
-                if (isset($node[$key]) && is_numeric($node[$key])) {
-                    return (float) $node[$key];
-                }
-            }
-        }
-
-        return null;
-    }
-
     /**
      * Handle payment failed
      * Only called if order is NOT already in a successful state

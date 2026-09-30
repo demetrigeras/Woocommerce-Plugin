@@ -68,7 +68,6 @@ function sp_uninstall_plugin() {
     
     // Clean up any scheduled events
     wp_clear_scheduled_hook('sp_cleanup_expired_sessions');
-    wp_clear_scheduled_hook('sp_poll_pending_payments');
     
     // Flush rewrite rules
     flush_rewrite_rules();

@@ -156,7 +156,7 @@ class SP_Admin_Payments {
                             <tr style="height: 70px;">
                                 <td style="vertical-align: middle; width: 50px;">
                                     <?php if ($payment['order']): ?>
-                                        <a style="font-weight: bold;" href="<?php echo esc_url($payment['order']->get_edit_order_url()); ?>">
+                                        <a style="font-weight: bold;" href="<?php echo esc_url(admin_url('post.php?post=' . $payment['order']->get_id() . '&action=edit')); ?>">
                                             #<?php echo esc_html($payment['order']->get_order_number()); ?>
                                         </a>
                                     <?php else: ?>

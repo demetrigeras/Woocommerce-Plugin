@@ -370,13 +370,6 @@ function sp_commerce_deactivate() {
         SP_Webhook_Provisioner::disable();
     }
 
-    // Stop the missed-webhook sweep so a disabled plugin leaves no cron entry behind.
-    if (class_exists('SP_Order_Manager')) {
-        SP_Order_Manager::unschedule_polling();
-    } else {
-        wp_clear_scheduled_hook('sp_poll_pending_payments');
-    }
-
     // Optionally delete checkout page on deactivation
     // Uncomment if you want to clean up on deactivation
     // $page_id = get_option('sp_checkout_page_id');
@@ -1074,8 +1067,7 @@ function sp_always_show_refund_button($can_refund, $order) {
 add_action('woocommerce_checkout_process', 'sp_debug_checkout_process');
 function sp_debug_checkout_process() {
     error_log('🛒 PP - woocommerce_checkout_process action fired');
-    // The checkout POST carries the customer's name, email, phone and full address.
-    // Never write it to the log - only the payment method matters here.
+    error_log('🛒 PP - POST data: ' . json_encode($_POST));
     
     if (isset($_POST['payment_method'])) {
         error_log('🛒 PP - Payment method in POST: ' . $_POST['payment_method']);
