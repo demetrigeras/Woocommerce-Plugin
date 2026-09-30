@@ -165,8 +165,8 @@ class SP_API_Client {
     /**
      * Get purchase session status
      */
-    public function get_purchase_session_status($purchase_session_id) {
-        $endpoint = $this->api_base_url . '/purchase/status/' . $purchase_session_id;
+    public function get_purchase_session_status($purchase_session_id, $timeout = 30) {
+        $endpoint = rtrim($this->api_base_url, '/') . '/purchase/status/' . rawurlencode($purchase_session_id);
         
         $headers = array(
             'Content-Type' => 'application/json',
@@ -177,18 +177,31 @@ class SP_API_Client {
         
         $response = wp_remote_get($endpoint, array(
             'headers' => $headers,
-            'timeout' => 30
+            'timeout' => (int) $timeout
         ));
         
         if (is_wp_error($response)) {
+            error_log('PP API - Purchase status transport error for ' . $endpoint . ': ' . $response->get_error_message());
             return new WP_Error('api_error', $response->get_error_message());
         }
         
+        $code = (int) wp_remote_retrieve_response_code($response);
         $body = wp_remote_retrieve_body($response);
         $data = json_decode($body, true);
         
-        if (wp_remote_retrieve_response_code($response) !== 200) {
-            return new WP_Error('api_error', isset($data['message']) ? $data['message'] : 'API request failed');
+        if ($code !== 200) {
+            // The status code and body are the whole diagnosis here: a bare
+            // "API request failed" cannot distinguish a wrong path from a rejected
+            // key from a session id the API has never heard of.
+            $message = '';
+            foreach (array('error', 'message') as $key) {
+                if (isset($data[$key]) && is_scalar($data[$key])) {
+                    $message = (string) $data[$key];
+                    break;
+                }
+            }
+            error_log('PP API - Purchase status HTTP ' . $code . ' from ' . $endpoint . ' - body: ' . substr($body, 0, 300));
+            return new WP_Error('api_error', 'HTTP ' . $code . ($message !== '' ? ': ' . $message : ''));
         }
         
         return $data;

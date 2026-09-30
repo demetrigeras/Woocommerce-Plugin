@@ -25,12 +25,38 @@ class SP_Order_Manager {
      */
     private static $admin_subscription_extras_done = array();
 
+    /** Cron hook for the missed-webhook sweep. */
+    const POLL_HOOK = 'sp_poll_pending_payments';
+
+    /** Seconds between sweeps. */
+    const POLL_INTERVAL = 300;
+
+    /** Minimum seconds between provider status checks for the same order. */
+    const POLL_THROTTLE = 120;
+
+    /** How far back a sweep looks. Past this an unpaid order is left alone. */
+    const POLL_MAX_AGE = DAY_IN_SECONDS;
+
+    /** Orders examined per sweep. */
+    const POLL_BATCH = 20;
+
     /**
      * Constructor
      */
     public function __construct() {
         add_action('woocommerce_order_status_changed', array($this, 'handle_order_status_change'), 10, 3);
         add_action('wp_ajax_sp_admin_cancel_subscription', array($this, 'ajax_admin_cancel_subscription'));
+
+        // The webhook is the fast path; polling is the guarantee. A delivery that is
+        // never sent, rejected on signature, or can't be matched to an order otherwise
+        // strands a payment that has already settled on-chain. So ask the provider
+        // directly: when the customer is looking at the order, and on a sweep for the
+        // ones who never return to the site.
+        add_filter('cron_schedules', array($this, 'add_cron_interval'));
+        add_action('woocommerce_thankyou', array($this, 'poll_on_order_page'), 5, 1);
+        add_action('woocommerce_view_order', array($this, 'poll_on_order_page'), 5, 1);
+        add_action(self::POLL_HOOK, array($this, 'poll_pending_orders'));
+        self::schedule_polling();
 
         // WooCommerce emails print the payment method title that was stored on the
         // order at checkout. That value is a snapshot, so any order placed before a
@@ -417,7 +443,9 @@ class SP_Order_Manager {
             if ($parent_order_id) {
                 $parent_order = wc_get_order($parent_order_id);
                 if ($parent_order) {
-                    $parent_order_url = admin_url('post.php?post=' . $parent_order_id . '&action=edit');
+                    // get_edit_order_url() resolves to the right screen under both the
+                    // legacy posts table and High-Performance Order Storage.
+                    $parent_order_url = $parent_order->get_edit_order_url();
                     $html .= '<div class="sp-renewal-info" style="background: #e7f3ff; border: 1px solid #b3d9ff; padding: 15px; margin: 10px 0; border-radius: 5px;">';
                     $html .= '<h4 style="margin: 0 0 10px 0; color: #0056b3;">🔄 Renewal Order</h4>';
                     $html .= '<p style="margin: 0; font-size: 14px;">';
@@ -439,7 +467,7 @@ class SP_Order_Manager {
                 foreach ($renewal_orders as $renewal_order_id) {
                     $renewal_order = wc_get_order($renewal_order_id);
                     if ($renewal_order) {
-                        $renewal_order_url = admin_url('post.php?post=' . $renewal_order_id . '&action=edit');
+                        $renewal_order_url = $renewal_order->get_edit_order_url();
                         $renewal_status = $renewal_order->get_status();
                         $status_colors = array(
                             'processing' => '#0073aa',
@@ -738,36 +766,215 @@ class SP_Order_Manager {
     }
     
     /**
-     * Sync order status with Stablecoin Pay
+     * Ask the provider what actually happened to an order's purchase session and apply
+     * it locally.
+     *
+     * This is the backup for a payment webhook that never arrived or was rejected.
+     * Nothing else moves a Stablecoin Pay order out of "Pending payment", so without
+     * this an order whose delivery was lost stays unpaid forever while the money has
+     * already settled on-chain.
+     *
+     * Deliberately one-directional: it only ever runs on an order still waiting for its
+     * first payment, so a stale or partial read can never contradict a webhook that did
+     * get through.
+     *
+     * @param WC_Order|int $order
+     * @return bool Whether the order was moved out of its unpaid state.
      */
     public function sync_order_status($order) {
-        $status = $this->get_sp_order_status($order);
-        
-        if (!$status) {
-            return;
+        if (is_numeric($order)) {
+            $order = wc_get_order($order);
         }
-        
-        $sp_status = $status['purchase_session_status'] ?? 'unknown';
-        
-        switch ($sp_status) {
-            case 'completed':
-                if ($order->get_status() !== 'processing' && $order->get_status() !== 'completed') {
-                    $order->update_status('processing', __('Payment confirmed via payment provider', 'stablecoin-pay'));
-                }
-                break;
-                
-            case 'failed':
-                if ($order->get_status() !== 'failed') {
-                    $order->update_status('failed', __('Payment failed via payment provider', 'stablecoin-pay'));
-                }
-                break;
-                
-            case 'expired':
-                if ($order->get_status() !== 'cancelled') {
-                    $order->update_status('cancelled', __('Payment session expired', 'stablecoin-pay'));
-                }
-                break;
+        if (!$order instanceof WC_Order || $order->get_payment_method() !== 'sp') {
+            return false;
+        }
+        if (!in_array($order->get_status(), array('pending', 'on-hold'), true)) {
+            return false;
+        }
+        // A payment id is only ever written by the webhook completion path, so its
+        // presence means a delivery was already processed and polling has no business
+        // second-guessing it.
+        if (!empty($order->get_meta('_sp_payment_id'))) {
+            return false;
+        }
+        $purchase_session_id = $order->get_meta('_sp_purchase_session_id');
+        if (empty($purchase_session_id)) {
+            return false;
+        }
+        if (!$this->claim_status_check($order)) {
+            return false;
+        }
+
+        // Short timeout: this runs inline on the order pages, so an unresponsive
+        // provider must not hold up the page. The sweep will try again.
+        $api_client = new SP_API_Client();
+        $response   = $api_client->get_purchase_session_status($purchase_session_id, 10);
+
+        if (is_wp_error($response)) {
+            // Never act on a failed lookup. An unreachable provider is not evidence
+            // that a payment did not happen.
+            error_log('PP Poll: status lookup failed for order #' . $order->get_id() . ': ' . $response->get_error_message());
+            return false;
+        }
+
+        $payload   = self::unwrap_session_payload($response);
+        $sp_status = self::extract_session_status($payload);
+
+        // The exact shape of this response has never been confirmed against the live
+        // API, so record what came back. Keys only - the payload carries buyer details.
+        error_log('PP Poll: order #' . $order->get_id() . ' session ' . $purchase_session_id
+            . ' reports "' . $sp_status . '" (keys: ' . implode(',', array_keys($payload)) . ')');
+
+        if (in_array($sp_status, self::$paid_statuses, true)) {
+            // Replay the webhook's completion path so an order confirmed by polling is
+            // indistinguishable from one confirmed by a delivery.
+            SP_Webhook_Handler::instance()->handle_payment_completed($order, $payload);
+            $order->add_order_note(__('Payment confirmed by status check - no payment webhook was received for this order.', 'stablecoin-pay'));
+            return true;
+        }
+
+        // Everything else is only written to the log, never to the order.
+        //
+        // Polling exists to rescue a payment whose webhook went missing, so the only
+        // transition worth the risk is the one that moves an order forward. Failing or
+        // cancelling on a polled status would mean destroying a live order on the
+        // strength of a string from an endpoint whose vocabulary we have not verified,
+        // and an order the customer is still paying for looks exactly like one they
+        // abandoned. The webhook already reports failures and cancellations, and it is
+        // signed, so it is the one source allowed to end an order.
+        if ($sp_status !== '') {
+            error_log('PP Poll: leaving order #' . $order->get_id() . ' as "' . $order->get_status()
+                . '" - status check reported "' . $sp_status . '", which only the webhook may act on');
+        }
+
+        return false;
+    }
+
+    /**
+     * Poll the order the customer is looking at right now. Covers the common case: the
+     * delivery was missed while they were paying and they have just landed back on
+     * order-received or view-order.
+     *
+     * @param int $order_id
+     */
+    public function poll_on_order_page($order_id) {
+        $this->sync_order_status(absint($order_id));
+    }
+
+    /**
+     * Sweep orders still waiting on a payment webhook, for the customers who never come
+     * back to the site after paying.
+     */
+    public function poll_pending_orders() {
+        $orders = wc_get_orders(array(
+            'payment_method' => 'sp',
+            'status'         => array('pending', 'on-hold'),
+            'limit'          => self::POLL_BATCH,
+            'orderby'        => 'date',
+            'order'          => 'DESC',
+            'date_created'   => '>' . (time() - self::POLL_MAX_AGE),
+        ));
+
+        foreach ($orders as $order) {
+            $this->sync_order_status($order);
         }
     }
-    
+
+    /**
+     * One provider call per order per POLL_THROTTLE seconds. The order pages can be
+     * reloaded freely and the sweep overlaps with them.
+     *
+     * @param WC_Order $order
+     * @return bool Whether this caller may perform the check.
+     */
+    private function claim_status_check($order) {
+        $key = 'sp_status_check_' . $order->get_id();
+        if (get_transient($key)) {
+            return false;
+        }
+        set_transient($key, time(), self::POLL_THROTTLE);
+        return true;
+    }
+
+    /**
+     * Statuses that mean the money arrived.
+     *
+     * "success" is absent on purpose. A great many APIs wrap their responses as
+     * {"status":"success","data":{...}}, where that word describes the HTTP call and
+     * says nothing about the payment - treating it as payment confirmation would mark
+     * every unpaid order as paid.
+     *
+     * @var string[]
+     */
+    private static $paid_statuses = array('completed', 'complete', 'paid', 'succeeded', 'settled');
+
+    /**
+     * Status out of a purchase-session status response.
+     *
+     * @param array $payload Payload, already unwrapped from any envelope.
+     * @return string Lower-cased status, or '' when none was reported.
+     */
+    private static function extract_session_status($payload) {
+        foreach (array('purchase_session_status', 'session_status', 'payment_status', 'status', 'state') as $key) {
+            if (isset($payload[$key]) && is_scalar($payload[$key]) && (string) $payload[$key] !== '') {
+                return strtolower(trim((string) $payload[$key]));
+            }
+        }
+        return '';
+    }
+
+    /**
+     * The payment object out of the response.
+     *
+     * Returns the inner node when the response is enveloped rather than merging the two
+     * levels together, so an outer transport "status" can never be mistaken for the
+     * payment's own.
+     *
+     * @param mixed $response
+     * @return array
+     */
+    private static function unwrap_session_payload($response) {
+        if (!is_array($response)) {
+            return array();
+        }
+        if (isset($response['data']) && is_array($response['data']) && !empty($response['data'])) {
+            return $response['data'];
+        }
+        return $response;
+    }
+
+    /**
+     * Register the sweep. Cheap to call on every load - it only writes when nothing is
+     * scheduled yet.
+     */
+    public static function schedule_polling() {
+        if (!wp_next_scheduled(self::POLL_HOOK)) {
+            wp_schedule_event(time() + self::POLL_INTERVAL, 'sp_five_minutes', self::POLL_HOOK);
+        }
+    }
+
+    /**
+     * Drop the sweep, so a deactivated plugin leaves no cron entry behind.
+     */
+    public static function unschedule_polling() {
+        wp_clear_scheduled_hook(self::POLL_HOOK);
+    }
+
+    /**
+     * @param array $schedules
+     * @return array
+     */
+    public function add_cron_interval($schedules) {
+        if (!is_array($schedules)) {
+            $schedules = array();
+        }
+        if (!isset($schedules['sp_five_minutes'])) {
+            $schedules['sp_five_minutes'] = array(
+                'interval' => self::POLL_INTERVAL,
+                'display'  => __('Every 5 minutes (Stablecoin Pay)', 'stablecoin-pay'),
+            );
+        }
+        return $schedules;
+    }
+
 }

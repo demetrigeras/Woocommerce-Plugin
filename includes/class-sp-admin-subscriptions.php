@@ -130,7 +130,7 @@ class SP_Admin_Subscriptions {
                         <?php foreach ($subscriptions as $sub): ?>
                         <tr style="height: 70px;">
                             <td style="vertical-align: middle; width: 40px;">
-                                <a style="font-weight: bold;" href="<?php echo esc_url(admin_url('post.php?post=' . $sub['order_id'] . '&action=edit')); ?>">
+                                <a style="font-weight: bold;" href="<?php echo esc_url($sub['edit_url']); ?>">
                                     #<?php echo esc_html($sub['order_number']); ?>
                                 </a>
                             </td>
@@ -380,6 +380,9 @@ class SP_Admin_Subscriptions {
             
             $subscriptions[] = array(
                 'order_id' => $order->get_id(),
+                // Resolved from the order so the link works under both the legacy posts
+                // table and High-Performance Order Storage.
+                'edit_url' => $order->get_edit_order_url(),
                 'order_number' => $order->get_order_number(),
                 'agreement_id' => $agreement_id,
                 'customer_name' => $order->get_billing_first_name() . ' ' . $order->get_billing_last_name(),
