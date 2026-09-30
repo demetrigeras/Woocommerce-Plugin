@@ -42,14 +42,15 @@ return array(
 
     // Flat network fee the payment method charges per payment, in the store's currency.
     //
-    // TEMPORARY: the DFNS method this build uses settles at a near-constant cost, so the
-    // figure is pinned here rather than read from the payment. The customer is shown and
-    // charged it inside the hosted checkout, which is after WooCommerce has finished
-    // totalling the order - so the plugin adds it to the order as a fee line once payment
-    // completes, which is what makes the order summary add up to what was actually paid.
+    // TEMPORARY: the DFNS method this build uses settles at roughly the same cost every
+    // time (observed at 10-11 cents), so the figure is pinned here rather than read from
+    // the payment. The customer is shown and charged it inside the hosted checkout, which
+    // is after WooCommerce has finished totalling the order - so the plugin adds it to the
+    // order as a fee line once payment completes, which is what makes the order summary
+    // add up to what was actually paid.
     //
     // Omit the key (or set 0) on builds whose method does not charge it.
-    'network_fee' => 0.11,
+    'network_fee' => 0.10,
 
     // Zip filename produced by create-plugin-package.sh when this config is present.
     'zip_name' => 'syncharge-plugin.zip',
