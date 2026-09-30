@@ -75,3 +75,4 @@ function sp_uninstall_plugin() {
 
 // Run uninstall
 sp_uninstall_plugin();
+//TODO: remove this line after testing
